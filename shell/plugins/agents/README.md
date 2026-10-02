@@ -75,6 +75,7 @@ light surfaces — and the bar glyph stands in when there is none.
 | `codex` | The Codex app-server RPC | native Codex CLI session files on the built-in `openai` provider (plus pi and opencode sessions) |
 | `grok` | The credits endpoint behind Grok's `/usage` view (the billing period's included usage) | Each session's `usage.json` (the ledger `grok usage` prints: tokens by model per finished turn), plus `summary.json` for sessions |
 | `fireworks` | Estimated prepaid balance: configured funding minus rated account costs | Fireworks billing API, grouped by day and model for the last 30 days |
+| `antigravity` | Google Cloud Code API (`loadCodeAssist` and `retrieveUserQuotaSummary`) with rolling session/weekly calculation fallback | Transcripts and history logs under `~/.gemini/antigravity-cli/` (`AGY_DIR`) |
 
 When `~/.local/state/omarchy/agents/accounts/<claude|codex|grok>.json`
 registers more than one account, the `claude`, `codex`, and `grok` records
@@ -92,7 +93,9 @@ account changed.
 
 Codex CLI will front any OpenAI-compatible backend — `--oss`, or a custom `model_provider` in `config.toml` aimed at Ollama, LM Studio, or a gateway — and those rollouts sit in the same sessions directory as OpenAI-backed ones. The Codex collector skips a rollout whose first `session_meta.model_provider` names anything but the built-in `openai` provider. Rollouts written before Codex recorded that field carry no provider and still count.
 
-Claude limits need a signed-in CLI; without credentials the panel says so and
+Antigravity checks authentication via the Secret Service keyring
+(`gemini`/`antigravity`), queries Google's Cloud Code endpoints for account
+tier and quota limits, and honors a custom app root via `AGY_DIR`. Claude limits need a signed-in CLI; without credentials the panel says so and
 falls back to local stats only. A non-default Claude directory is honored via
 `CLAUDE_CONFIG_DIR`, Codex via `CODEX_HOME`, Grok via `GROK_HOME`. Grok's
 plan comes from the settings it caches in its home, and its limit from the
