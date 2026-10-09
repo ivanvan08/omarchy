@@ -36,7 +36,7 @@ cat >"$AGY_DIR/brain/test-conv/.system_generated/logs/transcript.jsonl" <<EOF
 EOF
 
 collect() {
-  env -u PI_CODING_AGENT_DIR -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
+  env -u PI_CODING_AGENT_DIR -u OPENCLAW_STATE_DIR -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
     HOME="$TEST_HOME" AGY_DIR="$AGY_DIR" XDG_CACHE_HOME="$TEST_HOME/.cache" PATH="$TEST_HOME/bin:$PATH" \
     "$ROOT/bin/omarchy-agent-usage-agy" --force
 }
