@@ -35,6 +35,13 @@ from pathlib import Path
 AGENT_ID = "agy"
 AGENT_NAME = "Antigravity"
 AUTH_HELP = "Run `agy` to sign in, or sign in to Antigravity in omp, pi, or opencode."
+# The panel reads "Waiting for auth" and "Sign-in expired" as "offer to sign
+# in here", and its link runs omarchy-agent-account-add, which knows Claude,
+# Codex, and Grok only. Antigravity is signed in outside the panel, so its
+# record names the state in words and leaves the instruction to authHelpText,
+# which the panel prints where the link would have been.
+NO_SIGN_IN = "No Antigravity sign-in"
+LAPSED = "Antigravity sign-in expired"
 # How each source is named when its sign-in needs refreshing.
 SOURCE_NAMES = {"agy": "`agy`", "omp": "omp", "pi": "pi", "opencode": "opencode"}
 # A panel opened and shut repeatedly reuses an answer for about a minute.
@@ -306,10 +313,14 @@ def post(endpoint, token):
 
 
 # A window kept from an earlier check is dropped once it has reset, since
-# what it said no longer holds.
+# what it said no longer holds. A damaged cache entry is dropped with it
+# rather than taken down the collector.
 def open_windows(limits):
   now = datetime.now(timezone.utc)
-  return [limit for limit in limits or [] if not parse_time(limit.get("resetsAt")) or parse_time(limit.get("resetsAt")) > now]
+  return [
+    limit for limit in (limits if isinstance(limits, list) else [])
+    if isinstance(limit, dict) and (not parse_time(limit.get("resetsAt")) or parse_time(limit.get("resetsAt")) > now)
+  ]
 
 
 # omp refreshes its own Antigravity sign-in when asked for usage, so its
@@ -377,7 +388,7 @@ def probe(entry, omp, now):
 def collect_limits(entries, force):
   result = {"limits": [], "tierLabel": "", "usageStatusText": "", "authHelpText": AUTH_HELP, "live": False, "fetchedAtMs": 0}
   if not entries:
-    result["usageStatusText"] = "Waiting for auth"
+    result["usageStatusText"] = NO_SIGN_IN
     return result
 
   now = time.time()
@@ -393,33 +404,36 @@ def collect_limits(entries, force):
   fetched_at = int(cached.get("fetchedAtMs") or 0)
   kept = open_windows(cached.get("limits"))
   tier = str(cached.get("tierLabel") or "")
-  # Limits kept for one Google account never stand in for another's, and
-  # without a way to tell which account they came from they are dropped
-  # rather than shown.
-  lead = (usable or signed_in or [{}])[0]
-  identity = identity_of(lead)
-  if not identity or identity != str(cached.get("identity") or ""):
+  # Limits kept from an earlier check belong to the account that earned them,
+  # so they stand in only while a sign-in for that account is still here:
+  # another account's never stand in for it, and without an identity to match
+  # they are dropped rather than shown.
+  signed_in_as = {identity_of(e) for e in entries}
+  if str(cached.get("identity") or "") not in signed_in_as - {""}:
     kept, tier, fetched_at = [], "", 0
+  lead = (usable or signed_in or [{}])[0]
   result.update(fetchedAtMs=fetched_at, tierLabel=tier)
 
   if not signed_in:
-    result.update(limits=kept, usageStatusText="Waiting for auth")
+    result.update(limits=kept, usageStatusText=NO_SIGN_IN)
     return result
 
   # A token left to lapse can't be used until its harness runs again.
   if not usable:
-    result.update(limits=kept, usageStatusText="Sign-in expired", authHelpText=expired_help(lead))
+    result.update(limits=kept, usageStatusText=LAPSED, authHelpText=expired_help(lead))
     return result
 
-  if kept and not force and now - fetched_at / 1000 < PROBE_REUSE_SECONDS:
+  # A panel opened and shut repeatedly reuses the answer it just got, but
+  # only for the account that answer describes.
+  if kept and not force and identity_of(lead) == str(cached.get("identity") or "") and now - fetched_at / 1000 < PROBE_REUSE_SECONDS:
     result.update(limits=kept, live=True)
     return result
 
   # A sign-in Google refuses gives way to the next one.
-  tier, limits, identity, rejected = "", None, "", None
+  tier_from_probe, limits, identity, rejected = "", None, "", None
   for entry in usable:
     try:
-      tier, limits, identity = probe(entry, omp, now)
+      tier_from_probe, limits, identity = probe(entry, omp, now)
     except Lapsed:
       rejected = rejected or entry
       continue
@@ -432,10 +446,15 @@ def collect_limits(entries, force):
     rejected = None
     break
   if rejected:
-    result.update(usageStatusText="Sign-in expired", authHelpText=expired_help(rejected))
+    result.update(usageStatusText=LAPSED, authHelpText=expired_help(rejected))
 
-  if tier:
-    result["tierLabel"] = tier
+  if tier_from_probe:
+    result["tierLabel"] = tier_from_probe
+  elif identity and identity != str(cached.get("identity") or ""):
+    # A plan label kept from an earlier check names the account that earned
+    # it, so it never stands in for another account's answer.
+    result["tierLabel"] = ""
+
   if limits:
     result.update(limits=limits, live=True, fetchedAtMs=round(time.time() * 1000))
     write_json(cache, {"fetchedAtMs": result["fetchedAtMs"], "limits": limits, "tierLabel": result["tierLabel"], "identity": identity})
@@ -526,7 +545,8 @@ def session_messages():
       message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
       if message.get("role") != "assistant" or message.get("provider") != "google-antigravity":
         continue
-      # A fork copies its parent's entries, so each answer counts once.
+      # A fork copies its parent's entries, and they keep their id, so each
+      # answer counts once.
       if entry.get("id"):
         key = (entry["id"], entry.get("timestamp")) if entry.get("timestamp") else (path, entry["id"])
         if key in seen:
@@ -539,7 +559,10 @@ def session_messages():
       day = local_day(entry.get("timestamp") or message.get("timestamp"))
       if any(tokens) and day:
         yield path, day, str(message.get("model") or "unknown"), tokens
-    proc.wait()
+    try:
+      proc.wait(timeout=1)
+    except Exception:
+      proc.kill()
 
 
 # opencode's Antigravity plugin runs under the "google" provider, with model
@@ -554,11 +577,13 @@ def opencode_messages():
   except sqlite3.Error:
     return
   try:
+    # The SQL is only acceleration: the Python filter below is the authority
+    # for which rows are this subscription's, and the guards in front can
+    # gate out a row it would have accepted.
     rows = conn.execute(
       "SELECT session_id, data FROM message"
-      " WHERE data LIKE '%\"providerID\"%:%\"google\"%' AND data LIKE '%antigravity-%'"
+      " WHERE data LIKE '%\"role\"%:%\"assistant\"%' AND data LIKE '%antigravity-%'"
       " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'"
-      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.providerID') END = 'google'"
     ).fetchall()
   except sqlite3.Error:
     rows = []
@@ -567,8 +592,11 @@ def opencode_messages():
   for session, raw in rows:
     try:
       entry = json.loads(raw)
+      provider = str(entry.get("providerID") or "")
       model = str(entry.get("modelID") or "")
-      if not model.startswith("antigravity-"):
+      # antigravity- is what the plugin prefixes its models with; Gemini
+      # asked for through the same provider id is a different subscription.
+      if not provider.startswith("google") or not model.startswith("antigravity-"):
         continue
       tokens = entry.get("tokens") if isinstance(entry.get("tokens"), dict) else {}
       cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
@@ -652,6 +680,8 @@ def local_stats(root):
       bucket["inputTokens"] += uncached
       bucket["outputTokens"] += output
       day = local_day(step.get("created_at"))
+      if day:
+        days.add(day)
       if day in by_day:
         by_day[day] += uncached + output
       if day == today:

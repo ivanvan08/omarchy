@@ -79,7 +79,19 @@ result=$(collect)
   fail "Antigravity collector keeps publishing past a malformed token count" "$result"
 pass "Antigravity collector keeps publishing past a malformed token count"
 
-[[ $(jq -c '{limits, usageStatusText}' <<<"$result") == '{"limits":[],"usageStatusText":"Waiting for auth"}' ]] ||
+# A transcript day the history log does not cover still counts as a day
+# Antigravity was used on.
+older=$(date -u -d '-2 days 12:00:00' +%Y-%m-%dT%H:%M:%SZ)
+echo "{\"step_index\":4,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"$older\",\"model\":\"gemini-3.8-flash-high\",\"usage\":{\"prompt_token_count\":10,\"candidates_token_count\":5}}" \
+  >>"$AGY_DIR/brain/test-conv/.system_generated/logs/transcript.jsonl"
+result=$(collect)
+older_day=$(date -d "$older" +%Y-%m-%d)
+
+[[ $(jq -c '{activeDays, hasOlderDay: (.activeDates | index("'"$older_day"'") != null), olderDay: ([.recentDays[] | select(.date == "'"$older_day"'") | .messageCount] | add)}' <<<"$result") == '{"activeDays":2,"hasOlderDay":true,"olderDay":15}' ]] ||
+  fail "Antigravity collector counts a transcript-only day as an active day" "$result"
+pass "Antigravity collector counts a transcript-only day as an active day"
+
+[[ $(jq -c '{limits, usageStatusText}' <<<"$result") == '{"limits":[],"usageStatusText":"No Antigravity sign-in"}' ]] ||
   fail "Antigravity collector makes up no limits from prompt counts" "$result"
 pass "Antigravity collector makes up no limits from prompt counts"
 

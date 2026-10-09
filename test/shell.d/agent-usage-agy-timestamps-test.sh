@@ -186,7 +186,7 @@ class TimestampTests(unittest.TestCase):
               result = collector.collect_limits([entry], force=True)
               if expired:
                 probe.assert_not_called()
-                self.assertEqual(result['usageStatusText'], 'Sign-in expired')
+                self.assertEqual(result['usageStatusText'], 'Antigravity sign-in expired')
                 self.assertFalse(result['live'])
               else:
                 self.assertEqual(probe.call_args_list, [
@@ -203,7 +203,7 @@ class TimestampTests(unittest.TestCase):
                   probe.side_effect = rejection
                   rejected = collector.collect_limits([entry], force=True)
                 probe.assert_called_once_with('loadCodeAssist', 'synthetic-token')
-                self.assertEqual(rejected['usageStatusText'], 'Sign-in expired')
+                self.assertEqual(rejected['usageStatusText'], 'Antigravity sign-in expired')
                 self.assertFalse(rejected['live'])
 
   def test_quota_reset_display_keeps_unknown_and_valid_windows(self):
@@ -246,6 +246,9 @@ class TimestampTests(unittest.TestCase):
                         time=types.SimpleNamespace(time=NOW.timestamp), post=probe):
           self.assertEqual(collector.open_windows(windows), unknown + future)
           self.assertEqual(collector.open_windows(None), [])
+          # A damaged cache entry is dropped, not raised over.
+          self.assertEqual(collector.open_windows([None, "junk", 5, dict(label='junk')]),
+                           [dict(label='junk')])
           entry = dict(source='agy', accessToken='synthetic-token', expiresAt=NOW.timestamp() + 3600)
           collector.write_json(Path(scratch) / 'agy-limits.json',
                                dict(limits=windows, tierLabel='Pro', fetchedAtMs=fetched,
