@@ -448,12 +448,15 @@ def collect_limits(entries, force):
   if rejected:
     result.update(usageStatusText=LAPSED, authHelpText=expired_help(rejected))
 
+  # A plan label, and limits, kept from an earlier check describe the account
+  # that earned them: they stand in for that account, or for a run nothing
+  # answered at all, but never beside another account's answer.
+  cached_identity = str(cached.get("identity") or "")
+  if identity and identity != cached_identity:
+    result["tierLabel"] = ""
+    kept = []
   if tier_from_probe:
     result["tierLabel"] = tier_from_probe
-  elif identity and identity != str(cached.get("identity") or ""):
-    # A plan label kept from an earlier check names the account that earned
-    # it, so it never stands in for another account's answer.
-    result["tierLabel"] = ""
 
   if limits:
     result.update(limits=limits, live=True, fetchedAtMs=round(time.time() * 1000))

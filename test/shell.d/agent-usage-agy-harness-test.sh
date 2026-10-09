@@ -64,6 +64,13 @@ answers = {
     {"window": "5h", "remainingFraction": 0.75, "resetTime": "2999-01-01T00:00:00Z"}
   ]}]},
 }
+# An account on a plan with no quota windows to report.
+plans_without_quota = {
+  "no-quota-token": {
+    "loadCodeAssist": {"paidTier": {"id": "g1-ultra-tier", "name": "Google AI Ultra"}},
+    "retrieveUserQuotaSummary": {"groups": []},
+  },
+}
 
 def urlopen(request, timeout=None):
   token = request.get_header("Authorization").removeprefix("Bearer ")
@@ -71,7 +78,8 @@ def urlopen(request, timeout=None):
     asked.write(token + "\n")
   if token not in os.environ["ACCEPTED"].split():
     raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, io.BytesIO())
-  return io.BytesIO(json.dumps(answers[request.full_url.rsplit(":", 1)[1]]).encode())
+  endpoint = request.full_url.rsplit(":", 1)[1]
+  return io.BytesIO(json.dumps(plans_without_quota.get(token, answers)[endpoint]).encode())
 
 collector.urllib.request.urlopen = urlopen
 sys.argv = ["omarchy-agent-usage-agy", "--force"]
@@ -164,7 +172,26 @@ rm -f "$test_tmp/asked"
 [[ $(jq -c '{tierLabel, percent: .limits[0].percent, usageStatusText}' <<<"$record") == '{"tierLabel":"","percent":0.6,"usageStatusText":""}' ]] ||
   fail "Antigravity collector keeps no other account's plan label" "$record"
 pass "Antigravity collector keeps no other account's plan label"
-rm -rf "$test_tmp/omp-report.json" "$test_tmp/.omp" "$test_tmp/.pi/agent/auth.json"
+
+# A newer account that reports a plan it has no quota windows for must not
+# end up wearing the kept account's meters beside that plan.
+pi_login pi-token "$(in_ms -60)" me@example.com
+omp_login omp-token "$(in_ms -60)" other@example.com
+rm -f "$test_tmp/omp-report.json"
+pi_login pi-token "$(in_ms 3600)" me@example.com
+record=$(collect pi-token)
+asked >/dev/null
+pi_login pi-token "$(in_ms -60)" me@example.com
+mkdir -p "$test_tmp/.local/share/opencode" "$test_tmp/.config/opencode"
+printf '{"google":{"type":"oauth","access":"no-quota-token","expires":%s}}\n' "$(in_ms 9999)" \
+  >"$test_tmp/.local/share/opencode/auth.json"
+echo '{"version":3,"accounts":[]}' >"$test_tmp/.config/opencode/antigravity-accounts.json"
+record=$(collect no-quota-token)
+[[ $(jq -c '{limits, tierLabel, usageStatusText}' <<<"$record") == '{"limits":[],"tierLabel":"Ultra","usageStatusText":"Antigravity limits unavailable"}' ]] ||
+  fail "Antigravity collector never pairs one account's plan with another's limits" "$record"
+pass "Antigravity collector never pairs one account's plan with another's limits"
+rm -rf "$test_tmp/.local/share/opencode" "$test_tmp/.config/opencode" "$test_tmp/.omp" "$test_tmp/.pi/agent/auth.json"
+rm -f "$test_tmp/asked"
 
 # opencode files any Google sign-in under "google"; only the Antigravity
 # plugin's accounts file makes it an Antigravity one.
