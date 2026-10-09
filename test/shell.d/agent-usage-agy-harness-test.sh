@@ -149,6 +149,16 @@ record=$(collect opencode-token)
   fail "Antigravity collector reads opencode's Antigravity plugin sign-in" "$record"
 pass "Antigravity collector reads opencode's Antigravity plugin sign-in only with the plugin"
 
+# opencode records no email for its sign-in, so a replaced sign-in has no
+# email to compare: without one, the kept limits must go rather than pass
+# for the new account's.
+printf '{"google":{"type":"oauth","access":"switched-token","refresh":"switched|p","expires":%s}}\n' "$(in_ms 3600)" \
+  >"$test_tmp/.local/share/opencode/auth.json"
+record=$(collect "")
+[[ $(jq -c '{limits, tierLabel, usageStatusText}' <<<"$record") == '{"limits":[],"tierLabel":"","usageStatusText":"Sign-in expired"}' ]] ||
+  fail "Antigravity collector drops kept limits when the account cannot be matched" "$record"
+pass "Antigravity collector drops kept limits when the account cannot be matched"
+
 # Antigravity used through pi, omp, OpenClaw, and opencode's plugin counts in
 # the local stats; Gemini through any other provider does not, and a forked
 # session's copy of an answer counts once.
