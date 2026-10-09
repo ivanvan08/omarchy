@@ -107,7 +107,10 @@ token refreshed most recently is asked first, and one Google refuses gives
 way to the next. omp is asked through `omp usage`, which refreshes its own
 sign-in, and its token then only names the plan. Every other harness
 refreshes its token while it runs; one left to lapse shows the last limits
-until that harness runs again. Hermes reaches Antigravity only through
+until that harness runs again. Because the panel's _Sign-in required_ link
+runs a sign-in flow that knows Claude, Codex, and Grok only, the Antigravity
+record names that state in words and puts the instruction in `authHelpText`
+instead of asking for a link. Hermes reaches Antigravity only through
 plugins that run `agy`, so its usage is agy's own. The record's id is
 `agy`, the name the default agent knows it by. Grok's
 plan comes from the settings it caches in its home, and its limit from the
