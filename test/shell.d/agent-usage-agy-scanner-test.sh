@@ -67,6 +67,18 @@ pass "Antigravity collector counts only the tokens transcripts report"
   fail "Antigravity collector parses input and output tokens" "$result"
 pass "Antigravity collector parses input and output tokens"
 
+# A transcript step whose token counts are not numbers must cost its own
+# numbers, not the whole record.
+cat >>"$AGY_DIR/brain/test-conv/.system_generated/logs/transcript.jsonl" <<EOF
+{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"$timestamp","model":"gemini-3.8-flash-high","usage":{"prompt_token_count":"unknown","candidates_token_count":null}}
+{"step_index":3,"type":"PLANNER_RESPONSE","created_at":"$timestamp","model":"gemini-3.8-flash-high","usage":{"prompt_token_count":1000,"candidates_token_count":500}}
+EOF
+result=$(collect)
+
+[[ $(jq -c '{todayTotalTokens, tokens: .modelUsage["gemini-3.8-flash-high"]}' <<<"$result") == '{"todayTotalTokens":1665,"tokens":{"inputTokens":1120,"outputTokens":545,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}' ]] ||
+  fail "Antigravity collector keeps publishing past a malformed token count" "$result"
+pass "Antigravity collector keeps publishing past a malformed token count"
+
 [[ $(jq -c '{limits, usageStatusText}' <<<"$result") == '{"limits":[],"usageStatusText":"Waiting for auth"}' ]] ||
   fail "Antigravity collector makes up no limits from prompt counts" "$result"
 pass "Antigravity collector makes up no limits from prompt counts"

@@ -246,10 +246,11 @@ class TimestampTests(unittest.TestCase):
                         time=types.SimpleNamespace(time=NOW.timestamp), post=probe):
           self.assertEqual(collector.open_windows(windows), unknown + future)
           self.assertEqual(collector.open_windows(None), [])
+          entry = dict(source='agy', accessToken='synthetic-token', expiresAt=NOW.timestamp() + 3600)
           collector.write_json(Path(scratch) / 'agy-limits.json',
-                               dict(limits=windows, tierLabel='Pro', fetchedAtMs=fetched))
-          result = collector.collect_limits([dict(source='agy', accessToken='synthetic-token',
-                                                 expiresAt=NOW.timestamp() + 3600)], force=True)
+                               dict(limits=windows, tierLabel='Pro', fetchedAtMs=fetched,
+                                    identity=collector.identity_of(entry)))
+          result = collector.collect_limits([entry], force=True)
           probe.assert_called_once_with('loadCodeAssist', 'synthetic-token')
           # JSON round trips create a new NaN, which cannot compare equal to
           # itself; compare serialized windows to also cover corrupt caches.

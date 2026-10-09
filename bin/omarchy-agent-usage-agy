@@ -19,6 +19,7 @@ agents panel only ever reads the JSON this prints.
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -125,6 +126,7 @@ def login():
     "expiresAt": expires.timestamp() if expires else 0,
     "authMethod": str(data.get("auth_method") or "consumer"),
     "email": email_of(data.get("id_token")),
+    "refresh": str(token.get("refresh_token") or data.get("refresh_token") or ""),
   }
 
 
@@ -141,6 +143,7 @@ def harness_login(source, data):
     "expiresAt": expires.timestamp() if expires else 0,
     "authMethod": "consumer",
     "email": str(data.get("email") or ""),
+    "refresh": str(data.get("refresh") or ""),
   }
 
 
@@ -202,6 +205,18 @@ def logins():
 def expired_help(entry):
   name = SOURCE_NAMES[entry["source"]]
   return f"The Antigravity sign-in {name} keeps expired. Start {name} to refresh it."
+
+
+# Which Google account a sign-in belongs to, so limits kept from an earlier
+# check can be tied to it: the email when the harness records one, otherwise
+# a digest of that harness' own token. The refresh token outlives the access
+# tokens that rotate; the access token, which changes with the account or a
+# refresh, drops the cache rather than let it pass for another's.
+def identity_of(entry):
+  if entry.get("email"):
+    return str(entry["email"])
+  secret = str(entry.get("refresh") or entry.get("accessToken") or "")
+  return f"{entry['source']}:{hashlib.sha256(secret.encode()).hexdigest()[:16]}" if secret else ""
 
 
 def email_of(id_token):
@@ -352,11 +367,11 @@ def probe(entry, omp, now):
         tier = extract_tier(post("loadCodeAssist", refreshed["accessToken"])) if token_fresh(refreshed, time.time()) else ""
       except Exception:
         tier = ""
-      return tier, extract_limits(quota) or None, email or entry["email"]
+      return tier, extract_limits(quota) or None, identity_of(refreshed)
     if not token_fresh(entry, now):
       raise Lapsed()
   tier = extract_tier(post("loadCodeAssist", entry["accessToken"]))
-  return tier, extract_limits(post("retrieveUserQuotaSummary", entry["accessToken"])) or None, entry["email"]
+  return tier, extract_limits(post("retrieveUserQuotaSummary", entry["accessToken"])) or None, identity_of(entry)
 
 
 def collect_limits(entries, force):
@@ -378,9 +393,12 @@ def collect_limits(entries, force):
   fetched_at = int(cached.get("fetchedAtMs") or 0)
   kept = open_windows(cached.get("limits"))
   tier = str(cached.get("tierLabel") or "")
-  # Limits kept for one Google account never stand in for another's.
+  # Limits kept for one Google account never stand in for another's, and
+  # without a way to tell which account they came from they are dropped
+  # rather than shown.
   lead = (usable or signed_in or [{}])[0]
-  if cached.get("email") and lead.get("email") and cached["email"] != lead["email"]:
+  identity = identity_of(lead)
+  if not identity or identity != str(cached.get("identity") or ""):
     kept, tier, fetched_at = [], "", 0
   result.update(fetchedAtMs=fetched_at, tierLabel=tier)
 
@@ -398,10 +416,10 @@ def collect_limits(entries, force):
     return result
 
   # A sign-in Google refuses gives way to the next one.
-  tier, limits, email, rejected = "", None, "", None
+  tier, limits, identity, rejected = "", None, "", None
   for entry in usable:
     try:
-      tier, limits, email = probe(entry, omp, now)
+      tier, limits, identity = probe(entry, omp, now)
     except Lapsed:
       rejected = rejected or entry
       continue
@@ -420,7 +438,7 @@ def collect_limits(entries, force):
     result["tierLabel"] = tier
   if limits:
     result.update(limits=limits, live=True, fetchedAtMs=round(time.time() * 1000))
-    write_json(cache, {"fetchedAtMs": result["fetchedAtMs"], "limits": limits, "tierLabel": result["tierLabel"], "email": email})
+    write_json(cache, {"fetchedAtMs": result["fetchedAtMs"], "limits": limits, "tierLabel": result["tierLabel"], "identity": identity})
   else:
     result["limits"] = kept
     if not result["usageStatusText"] and not kept:
@@ -627,8 +645,8 @@ def local_stats(root):
       usage = step.get("usage") if isinstance(step, dict) else None
       if not isinstance(usage, dict):
         continue
-      uncached = int(usage.get("prompt_token_count") or usage.get("input_tokens") or 0)
-      output = int(usage.get("candidates_token_count") or usage.get("output_tokens") or 0)
+      uncached = number(usage.get("prompt_token_count") or usage.get("input_tokens") or 0)
+      output = number(usage.get("candidates_token_count") or usage.get("output_tokens") or 0)
       model = str(step.get("model") or "unknown")
       bucket = model_bucket(models, model)
       bucket["inputTokens"] += uncached
