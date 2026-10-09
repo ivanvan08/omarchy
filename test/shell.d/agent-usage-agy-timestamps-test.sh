@@ -181,7 +181,7 @@ class TimestampTests(unittest.TestCase):
               entry = collector.login()
               self.assertEqual(entry['expiresAt'], expected)
               self.assertEqual(entry['accessToken'], 'synthetic-token')
-              result = collector.collect_limits(entry, force=True)
+              result = collector.collect_limits([entry], force=True)
               if expired:
                 probe.assert_not_called()
                 self.assertEqual(result['usageStatusText'], 'Sign-in expired')
@@ -199,7 +199,7 @@ class TimestampTests(unittest.TestCase):
                 with contextlib.closing(collector.urllib.error.HTTPError(
                     'https://example.invalid', 401, 'Unauthorized', {}, io.BytesIO())) as rejection:
                   probe.side_effect = rejection
-                  rejected = collector.collect_limits(entry, force=True)
+                  rejected = collector.collect_limits([entry], force=True)
                 probe.assert_called_once_with('loadCodeAssist', 'synthetic-token')
                 self.assertEqual(rejected['usageStatusText'], 'Sign-in expired')
                 self.assertFalse(rejected['live'])
@@ -246,8 +246,8 @@ class TimestampTests(unittest.TestCase):
           self.assertEqual(collector.open_windows(None), [])
           collector.write_json(Path(scratch) / 'agy-limits.json',
                                dict(limits=windows, tierLabel='Pro', fetchedAtMs=fetched))
-          result = collector.collect_limits(dict(accessToken='synthetic-token',
-                                                expiresAt=NOW.timestamp() + 3600), force=True)
+          result = collector.collect_limits([dict(source='agy', accessToken='synthetic-token',
+                                                 expiresAt=NOW.timestamp() + 3600)], force=True)
           probe.assert_called_once_with('loadCodeAssist', 'synthetic-token')
           # JSON round trips create a new NaN, which cannot compare equal to
           # itself; compare serialized windows to also cover corrupt caches.
@@ -276,7 +276,9 @@ class TimestampTests(unittest.TestCase):
         secret_tool = stub_dir / 'secret-tool'
         secret_tool.write_text('#!/bin/bash\nexit 1\n')
         secret_tool.chmod(0o755)
-        env = dict(os.environ, HOME=scratch, AGY_DIR=scratch, XDG_CACHE_HOME=str(root / 'cache'),
+        env = {key: value for key, value in os.environ.items()
+               if key not in ('PI_CODING_AGENT_DIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME')}
+        env.update(HOME=scratch, AGY_DIR=scratch, XDG_CACHE_HOME=str(root / 'cache'),
                    PATH=str(stub_dir) + os.pathsep + os.defpath, TZ=zone)
         for flag in ('--force', '--limits-only'):
           result = subprocess.run([str(collector_path), flag], env=env, capture_output=True,
