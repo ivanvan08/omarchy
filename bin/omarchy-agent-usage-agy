@@ -11,7 +11,9 @@ Local stats come from Antigravity's history log, conversation summaries, and
 conversation transcripts under ~/.gemini/antigravity-cli/. The plan and
 limits come from the Google Cloud Code API (v1internal:loadCodeAssist and
 v1internal:retrieveUserQuotaSummary), asked with the sign-in agy keeps in the
-Secret Service keyring. The agents panel only ever reads the JSON this prints.
+Secret Service keyring, or with the Antigravity sign-in omp, pi, or opencode
+keeps when agy itself isn't signed in. The agents panel only ever reads the
+JSON this prints.
 """
 
 import argparse
@@ -29,8 +31,9 @@ from pathlib import Path
 
 AGENT_ID = "agy"
 AGENT_NAME = "Antigravity"
-AUTH_HELP = "Run `agy` to sign in."
-EXPIRED_HELP = "Antigravity's saved sign-in expired. Start `agy` to refresh it."
+AUTH_HELP = "Run `agy` to sign in, or sign in to Antigravity in omp, pi, or opencode."
+# How each source is named when its sign-in needs refreshing.
+SOURCE_NAMES = {"agy": "`agy`", "omp": "omp", "pi": "pi", "opencode": "opencode"}
 # A panel opened and shut repeatedly reuses an answer for about a minute.
 PROBE_REUSE_SECONDS = 60
 # A limits-only refresh needs fresh limits, not a fresh history scan.
@@ -96,7 +99,8 @@ def local_day(value):
 
 
 # The sign-in agy keeps in the keyring: its access token, when that lapses,
-# and which kind of account it is.
+# and which kind of account it is. Without a Secret Service, agy keeps the
+# same token in a file under its home instead.
 def login():
   try:
     raw = subprocess.check_output(
@@ -107,16 +111,95 @@ def login():
   except Exception:
     data = None
   if not isinstance(data, dict):
+    data = read_json(app_root() / "antigravity-oauth-token")
+  if not isinstance(data, dict):
     return None
 
   token = data.get("token") if isinstance(data.get("token"), dict) else {}
   expires = parse_time(token.get("expiry") or data.get("expiry"))
   return {
+    "source": "agy",
     "accessToken": str(token.get("access_token") or data.get("access_token") or ""),
     "expiresAt": expires.timestamp() if expires else 0,
     "authMethod": str(data.get("auth_method") or "consumer"),
     "email": email_of(data.get("id_token")),
   }
+
+
+# omp, pi, and opencode's Antigravity plugin sign in with the same Google
+# client agy uses, so the access tokens they keep reach the same plan and
+# quota. Each refreshes its token while it runs; these are only ever read.
+def harness_login(source, data):
+  if not isinstance(data, dict) or data.get("type", "oauth") != "oauth" or not data.get("access"):
+    return None
+  expires = parse_time(data.get("expires"))
+  return {
+    "source": source,
+    "accessToken": str(data["access"]),
+    "expiresAt": expires.timestamp() if expires else 0,
+    "authMethod": "consumer",
+    "email": str(data.get("email") or ""),
+  }
+
+
+# omp and pi both honor PI_CODING_AGENT_DIR for their agent directory.
+def harness_dir(name):
+  return Path(os.environ.get("PI_CODING_AGENT_DIR") or (Path.home() / name / "agent"))
+
+
+def omp_logins():
+  database = harness_dir(".omp") / "agent.db"
+  if not database.is_file():
+    return []
+  try:
+    conn = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    try:
+      rows = conn.execute(
+        "SELECT data FROM auth_credentials WHERE provider = 'google-antigravity' "
+        "AND credential_type = 'oauth' AND disabled_cause IS NULL"
+      ).fetchall()
+    finally:
+      conn.close()
+  except sqlite3.Error:
+    return []
+  logins = []
+  for (data,) in rows:
+    try:
+      entry = harness_login("omp", json.loads(data))
+    except (TypeError, ValueError):
+      continue
+    if entry:
+      logins.append(entry)
+  return logins
+
+
+def pi_logins():
+  auth = read_json(harness_dir(".pi") / "auth.json")
+  entry = harness_login("pi", auth.get("google-antigravity")) if isinstance(auth, dict) else None
+  return [entry] if entry else []
+
+
+# opencode files the Antigravity plugin's sign-in under its "google"
+# provider, which other Google sign-ins share, so it only counts alongside
+# the plugin's own accounts file.
+def opencode_logins():
+  config_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+  if not (config_home / "opencode" / "antigravity-accounts.json").is_file():
+    return []
+  data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+  auth = read_json(data_home / "opencode" / "auth.json")
+  entry = harness_login("opencode", auth.get("google")) if isinstance(auth, dict) else None
+  return [entry] if entry else []
+
+
+def logins():
+  entry = login()
+  return ([entry] if entry else []) + omp_logins() + pi_logins() + opencode_logins()
+
+
+def expired_help(entry):
+  name = SOURCE_NAMES[entry["source"]]
+  return f"The Antigravity sign-in {name} keeps expired. Start {name} to refresh it."
 
 
 def email_of(id_token):
@@ -212,47 +295,65 @@ def open_windows(limits):
   return [limit for limit in limits or [] if not parse_time(limit.get("resetsAt")) or parse_time(limit.get("resetsAt")) > now]
 
 
-def collect_limits(entry, force):
+def collect_limits(entries, force):
   result = {"limits": [], "tierLabel": "", "usageStatusText": "", "authHelpText": AUTH_HELP, "live": False, "fetchedAtMs": 0}
-  if not entry:
+  if not entries:
     result["usageStatusText"] = "Waiting for auth"
     return result
+
+  now = time.time()
+  # Every harness refreshes its own token while it runs, so the one lapsing
+  # last was refreshed most recently. A token of unknown expiry is tried
+  # last, and only Google can say whether it still holds.
+  signed_in = sorted((e for e in entries if e["accessToken"]), key=lambda e: e["expiresAt"], reverse=True)
+  fresh = [e for e in signed_in if not e["expiresAt"] or e["expiresAt"] > now]
 
   cache = cache_root() / "agy-limits.json"
   cached = read_json(cache) or {}
   fetched_at = int(cached.get("fetchedAtMs") or 0)
   kept = open_windows(cached.get("limits"))
-  result.update(fetchedAtMs=fetched_at, tierLabel=str(cached.get("tierLabel") or ""))
+  tier = str(cached.get("tierLabel") or "")
+  # Limits kept for one Google account never stand in for another's.
+  lead = (fresh or signed_in or [{}])[0]
+  if cached.get("email") and lead.get("email") and cached["email"] != lead["email"]:
+    kept, tier, fetched_at = [], "", 0
+  result.update(fetchedAtMs=fetched_at, tierLabel=tier)
 
-  if not entry["accessToken"]:
+  if not signed_in:
     result.update(limits=kept, usageStatusText="Waiting for auth")
     return result
 
-  # agy refreshes its token while it runs; one left to lapse can't be used
-  # until agy starts again.
-  if entry["expiresAt"] and entry["expiresAt"] <= time.time():
-    result.update(limits=kept, usageStatusText="Sign-in expired", authHelpText=EXPIRED_HELP)
+  # A token left to lapse can't be used until its harness runs again.
+  if not fresh:
+    result.update(limits=kept, usageStatusText="Sign-in expired", authHelpText=expired_help(lead))
     return result
 
-  if kept and not force and time.time() - fetched_at / 1000 < PROBE_REUSE_SECONDS:
+  if kept and not force and now - fetched_at / 1000 < PROBE_REUSE_SECONDS:
     result.update(limits=kept, live=True)
     return result
 
-  tier, limits = "", None
-  try:
-    tier = extract_tier(post("loadCodeAssist", entry["accessToken"]))
-    limits = extract_limits(post("retrieveUserQuotaSummary", entry["accessToken"])) or None
-  except urllib.error.HTTPError as error:
-    if error.code in (401, 403):
-      result.update(usageStatusText="Sign-in expired", authHelpText=EXPIRED_HELP)
-  except Exception:
-    pass
+  # A sign-in Google refuses gives way to the next one.
+  tier, limits, rejected = "", None, None
+  for entry in fresh:
+    try:
+      tier = extract_tier(post("loadCodeAssist", entry["accessToken"]))
+      limits = extract_limits(post("retrieveUserQuotaSummary", entry["accessToken"])) or None
+    except urllib.error.HTTPError as error:
+      if error.code in (401, 403):
+        rejected = rejected or entry
+        continue
+    except Exception:
+      pass
+    lead, rejected = entry, None
+    break
+  if rejected:
+    result.update(usageStatusText="Sign-in expired", authHelpText=expired_help(rejected))
 
   if tier:
     result["tierLabel"] = tier
   if limits:
     result.update(limits=limits, live=True, fetchedAtMs=round(time.time() * 1000))
-    write_json(cache, {"fetchedAtMs": result["fetchedAtMs"], "limits": limits, "tierLabel": result["tierLabel"]})
+    write_json(cache, {"fetchedAtMs": result["fetchedAtMs"], "limits": limits, "tierLabel": result["tierLabel"], "email": lead.get("email", "")})
   else:
     result["limits"] = kept
     if not result["usageStatusText"] and not kept:
@@ -380,12 +481,13 @@ def main():
 
   # Nobody signed in to Antigravity here: no limits and no plan, so without
   # local history the panel skips the record.
-  entry = login()
-  limits = collect_limits(entry, args.force)
+  entries = logins()
+  limits = collect_limits(entries, args.force)
+  agy = next((e for e in entries if e["source"] == "agy"), None)
   tier = limits["tierLabel"]
-  if not tier and entry and entry["authMethod"] == "enterprise":
+  if not tier and agy and agy["authMethod"] == "enterprise":
     tier = "Enterprise"
-  elif not tier and entry and entry["authMethod"] in ("cloud", "vertex"):
+  elif not tier and agy and agy["authMethod"] in ("cloud", "vertex"):
     tier = "Cloud"
 
   record = {
@@ -393,7 +495,7 @@ def main():
     "id": AGENT_ID,
     "name": AGENT_NAME,
     "updatedAt": datetime.now(timezone.utc).isoformat(),
-    "ready": entry is not None,
+    "ready": bool(entries),
     "tierLabel": tier,
     "usageStatusText": limits["usageStatusText"],
     "authHelpText": limits["authHelpText"],

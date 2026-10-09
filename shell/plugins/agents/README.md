@@ -98,8 +98,15 @@ falls back to local stats only. A non-default Claude directory is honored via
 `CLAUDE_CONFIG_DIR`, Codex via `CODEX_HOME`, Grok via `GROK_HOME`,
 Antigravity via `AGY_DIR`. Antigravity's plan and limits are
 asked with the sign-in `agy` keeps in the Secret Service keyring (service
-`gemini`, username `antigravity`); the record's id is `agy`, the name the
-default agent knows it by. Grok's
+`gemini`, username `antigravity`, or `antigravity-oauth-token` under
+`AGY_DIR` without a keyring). Without `agy`, the Antigravity sign-in of
+another harness stands in: omp's `agent.db`, pi's `auth.json` (both under
+`PI_CODING_AGENT_DIR` when set), or opencode's `google` sign-in when the
+Antigravity plugin's `antigravity-accounts.json` is there. Of these, the
+token refreshed most recently is asked first, and one Google refuses gives
+way to the next. Each harness refreshes its token while it runs; one left to
+lapse shows the last limits until that harness runs again. The record's id is
+`agy`, the name the default agent knows it by. Grok's
 plan comes from the settings it caches in its home, and its limit from the
 credits endpoint its own `/usage` view reads, asked with each account's
 sign-in; a sign-in left to lapse shows the last credits until Grok runs

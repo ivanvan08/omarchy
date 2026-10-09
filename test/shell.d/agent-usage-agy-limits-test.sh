@@ -157,7 +157,8 @@ chmod +x "$test_tmp/bin/secret-tool"
 reset_at=$(python3 -c 'import datetime as dt; print((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3)).isoformat())')
 
 collect() {
-  HOME="$test_tmp" XDG_CACHE_HOME="$test_tmp/cache" PATH="$test_tmp/bin:$PATH" COLLECTOR="$COLLECTOR" RESET_AT="$reset_at" python3 - "$@" <<'PY'
+  env -u PI_CODING_AGENT_DIR -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
+    HOME="$test_tmp" XDG_CACHE_HOME="$test_tmp/cache" PATH="$test_tmp/bin:$PATH" COLLECTOR="$COLLECTOR" RESET_AT="$reset_at" python3 - "$@" <<'PY'
 import importlib.machinery, importlib.util, io, json, os, sys, urllib.error
 
 loader = importlib.machinery.SourceFileLoader("collector", os.environ["COLLECTOR"])
