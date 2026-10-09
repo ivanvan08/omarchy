@@ -17,7 +17,14 @@ cat >"$test_tmp/bin/secret-tool" <<'EOF'
 #!/bin/bash
 exit 1
 EOF
-chmod +x "$test_tmp/bin/secret-tool"
+# omp answers `omp usage` with the report in omp-report.json, when there is
+# one, and fails otherwise.
+cat >"$test_tmp/bin/omp" <<'EOF'
+#!/bin/bash
+[[ "$*" == "usage --json --provider google-antigravity" ]] || exit 2
+cat "$HOME/omp-report.json" 2>/dev/null
+EOF
+chmod +x "$test_tmp/bin/secret-tool" "$test_tmp/bin/omp"
 
 in_ms() {
   python3 -c "import sys, time; print(round((time.time() + float(sys.argv[1])) * 1000))" "$1"
@@ -41,7 +48,7 @@ pi_login() {
 # Google answers every token in ACCEPTED and refuses the rest; each request's
 # token is logged so a test can tell which sign-in was asked.
 collect() {
-  env -u PI_CODING_AGENT_DIR -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
+  env -u PI_CODING_AGENT_DIR -u OPENCLAW_STATE_DIR -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
     HOME="$test_tmp" XDG_CACHE_HOME="$test_tmp/cache" PATH="$test_tmp/bin:$PATH" \
     COLLECTOR="$COLLECTOR" ACCEPTED="$1" ASKED="$test_tmp/asked" python3 - <<'PY'
 import importlib.machinery, importlib.util, io, json, os, sys, urllib.error
@@ -109,6 +116,23 @@ record=$(collect "")
   fail "Antigravity collector shows no other Google account's kept limits" "$record"
 pass "Antigravity collector shows no other Google account's kept limits"
 
+# omp refreshes its own sign-in when asked for usage, so a lapsed token in
+# its database still gets live limits through `omp usage`.
+cat >"$test_tmp/omp-report.json" <<'EOF'
+{"reports":[{"provider":"google-antigravity","metadata":{"email":"other@example.com"},"limits":[
+  {"label":"Gemini","amount":{"usedFraction":0.6},"window":{"id":"5h","resetsAt":32503680000000}},
+  {"label":"Gemini","amount":{"usedFraction":0.3},"window":{"id":"weekly","resetsAt":32503680000000}},
+  {"label":"Claude & GPT (shared)","amount":{"usedFraction":0.1},"window":{"id":"weekly","resetsAt":32503680000000}},
+  {"label":"Claude & GPT (shared)","amount":{"usedFraction":0.1},"window":{"id":"weekly","resetsAt":32503680000000}}
+]}]}
+EOF
+record=$(collect "")
+[[ ! -e $test_tmp/asked ]] || fail "Antigravity collector sends omp's lapsed token nowhere" "$(asked)"
+[[ $(jq -c '{stale: .limitsStale, usageStatusText, limits: [.limits[] | {title, percent}]}' <<<"$record") == '{"stale":false,"usageStatusText":"","limits":[{"title":"Session","percent":0.6},{"title":"Weekly","percent":0.3},{"title":"Claude/GPT Weekly","percent":0.1}]}' ]] ||
+  fail "Antigravity collector takes omp's limits from omp usage" "$record"
+rm "$test_tmp/omp-report.json"
+pass "Antigravity collector takes omp's limits from omp usage"
+
 # opencode files any Google sign-in under "google"; only the Antigravity
 # plugin's accounts file makes it an Antigravity one.
 rm -rf "$test_tmp/.omp" "$test_tmp/cache"
@@ -124,3 +148,30 @@ record=$(collect opencode-token)
 [[ $(asked) == "opencode-token" && $(jq '.limits[0].percent' <<<"$record") == "0.25" ]] ||
   fail "Antigravity collector reads opencode's Antigravity plugin sign-in" "$record"
 pass "Antigravity collector reads opencode's Antigravity plugin sign-in only with the plugin"
+
+# Antigravity used through pi, omp, OpenClaw, and opencode's plugin counts in
+# the local stats; Gemini through any other provider does not, and a forked
+# session's copy of an answer counts once.
+if command -v rg >/dev/null; then
+  now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  mkdir -p "$test_tmp/.omp/agent/sessions/project" "$test_tmp/.openclaw/agents/main/sessions"
+  answer='{"type":"message","id":"a1","timestamp":"'$now'","message":{"role":"assistant","provider":"google-antigravity","model":"gemini-3-pro","usage":{"input":100,"output":20,"cacheRead":5,"cacheWrite":0}}}'
+  printf '%s\n%s\n' "$answer" \
+    '{"type":"message","id":"a2","timestamp":"'$now'","message":{"role":"assistant","provider":"google-gemini-cli","model":"gemini-3-pro","usage":{"input":999,"output":999}}}' \
+    >"$test_tmp/.omp/agent/sessions/project/one.jsonl"
+  printf '%s\n' "$answer" >"$test_tmp/.omp/agent/sessions/project/fork.jsonl"
+  # OpenClaw's entries carry no id; two alike answers are two answers.
+  openclaw='{"type":"message","timestamp":"'$now'","message":{"role":"assistant","provider":"google-antigravity","model":"gemini-3-pro","usage":{"input":1,"output":1}}}'
+  printf '%s\n%s\n' "$openclaw" "$openclaw" >"$test_tmp/.openclaw/agents/main/sessions/s.jsonl"
+  sqlite3 "$test_tmp/.local/share/opencode/opencode.db" \
+    "CREATE TABLE message (session_id TEXT, data TEXT);
+     INSERT INTO message VALUES
+       ('s1', '{\"role\":\"assistant\",\"providerID\":\"google\",\"modelID\":\"antigravity-gemini-3-pro\",\"time\":{\"created\":$(in_ms 0)},\"tokens\":{\"input\":10,\"output\":5,\"reasoning\":1,\"cache\":{\"read\":2,\"write\":0}}}'),
+       ('s2', '{\"role\":\"assistant\",\"providerID\":\"google\",\"modelID\":\"gemini-3-pro\",\"time\":{\"created\":$(in_ms 0)},\"tokens\":{\"input\":999,\"output\":999}}');"
+  record=$(collect "")
+  [[ $(jq -c '{hasLocalStats, totalPrompts, totalSessions, todayTotalTokens, models: (.modelUsage | keys)}' <<<"$record") == '{"hasLocalStats":true,"totalPrompts":4,"totalSessions":3,"todayTotalTokens":147,"models":["antigravity-gemini-3-pro","gemini-3-pro"]}' ]] ||
+    fail "Antigravity collector counts usage from pi, omp, OpenClaw, and opencode's plugin" "$record"
+  pass "Antigravity collector counts usage from pi, omp, OpenClaw, and opencode's plugin"
+else
+  skip "Antigravity collector counts usage from pi, omp, OpenClaw, and opencode's plugin (no rg)"
+fi

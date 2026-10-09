@@ -27,6 +27,8 @@ collector_path = Path(sys.argv.pop())
 collector = types.SimpleNamespace(**runpy.run_path(str(collector_path)))
 # Functions loaded by runpy share this namespace, rather than the wrapper.
 namespace = collector.local_stats.__globals__
+# These cases are about agy's own records; the host's other harnesses stay out.
+namespace['harness_messages'] = lambda: iter(())
 NOW = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
 ZONES = ('UTC0', 'EST5', 'JST-9')  # Fixed offsets; no host zoneinfo or DST rules.
 INVALID = (None, '', 'not a date', '2026-02-30T12:00:00Z', [], {}, True,
@@ -277,7 +279,7 @@ class TimestampTests(unittest.TestCase):
         secret_tool.write_text('#!/bin/bash\nexit 1\n')
         secret_tool.chmod(0o755)
         env = {key: value for key, value in os.environ.items()
-               if key not in ('PI_CODING_AGENT_DIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME')}
+               if key not in ('PI_CODING_AGENT_DIR', 'OPENCLAW_STATE_DIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME')}
         env.update(HOME=scratch, AGY_DIR=scratch, XDG_CACHE_HOME=str(root / 'cache'),
                    PATH=str(stub_dir) + os.pathsep + os.defpath, TZ=zone)
         for flag in ('--force', '--limits-only'):
