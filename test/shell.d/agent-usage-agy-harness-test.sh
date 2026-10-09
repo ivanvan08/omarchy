@@ -102,11 +102,24 @@ record=$(collect omp-token)
   fail "Antigravity collector moves on from a sign-in Google refuses" "$record"
 pass "Antigravity collector moves on from a sign-in Google refuses"
 
+# The account that earned the kept limits is still signed in, so they stand
+# in when a newer sign-in is refused and the rest cannot answer either.
+mkdir -p "$test_tmp/.local/share/opencode" "$test_tmp/.config/opencode"
+printf '{"google":{"type":"oauth","access":"newer-token","refresh":"newer|p","expires":%s}}\n' "$(in_ms 9999)" \
+  >"$test_tmp/.local/share/opencode/auth.json"
+echo '{"version":3,"accounts":[]}' >"$test_tmp/.config/opencode/antigravity-accounts.json"
+record=$(collect "")
+[[ $(jq -c '{stale: .limitsStale, usageStatusText, percent: .limits[0].percent}' <<<"$record") == '{"stale":true,"usageStatusText":"Antigravity sign-in expired","percent":0.25}' ]] ||
+  fail "Antigravity collector keeps limits whose account is still signed in when every sign-in fails" "$record"
+pass "Antigravity collector keeps limits whose account is still signed in when every sign-in fails"
+asked >/dev/null
+rm -rf "$test_tmp/.local/share/opencode" "$test_tmp/.config/opencode"
+
 rm -rf "$test_tmp/.pi"
 omp_login omp-token "$(in_ms -60)" me@example.com
 record=$(collect omp-token)
 [[ ! -e $test_tmp/asked ]] || fail "Antigravity collector sends no lapsed token to Google" "$(asked)"
-[[ $(jq -c '{ready, stale: .limitsStale, usageStatusText, authHelpText, percent: .limits[0].percent}' <<<"$record") == '{"ready":true,"stale":true,"usageStatusText":"Sign-in expired","authHelpText":"The Antigravity sign-in omp keeps expired. Start omp to refresh it.","percent":0.25}' ]] ||
+[[ $(jq -c '{ready, stale: .limitsStale, usageStatusText, authHelpText, percent: .limits[0].percent}' <<<"$record") == '{"ready":true,"stale":true,"usageStatusText":"Antigravity sign-in expired","authHelpText":"The Antigravity sign-in omp keeps expired. Start omp to refresh it.","percent":0.25}' ]] ||
   fail "Antigravity collector keeps the last limits and names the harness whose sign-in lapsed" "$record"
 pass "Antigravity collector keeps the last limits and names the harness whose sign-in lapsed"
 
@@ -133,6 +146,26 @@ record=$(collect "")
 rm "$test_tmp/omp-report.json"
 pass "Antigravity collector takes omp's limits from omp usage"
 
+# The plan label kept from an earlier check names the account that earned it.
+# omp answers for a different account, which reports limits but no plan.
+pi_login pi-token "$(in_ms 3600)" me@example.com
+record=$(collect pi-token)
+asked >/dev/null
+pi_login pi-token "$(in_ms -60)" me@example.com
+cmp_report='{"reports":[{"provider":"google-antigravity","metadata":{"email":"other@example.com"},"limits":[
+  {"label":"Gemini","amount":{"usedFraction":0.6},"window":{"id":"5h","resetsAt":32503680000000}}
+]}]}'
+omp_login omp-token "$(in_ms -60)" other@example.com
+echo "$cmp_report" >"$test_tmp/omp-report.json"
+[[ $(jq -r '.tierLabel' <<<"$record") == "Pro" ]] ||
+  fail "Antigravity collector records the plan of the account that answered" "$record"
+record=$(collect "")
+rm -f "$test_tmp/asked"
+[[ $(jq -c '{tierLabel, percent: .limits[0].percent, usageStatusText}' <<<"$record") == '{"tierLabel":"","percent":0.6,"usageStatusText":""}' ]] ||
+  fail "Antigravity collector keeps no other account's plan label" "$record"
+pass "Antigravity collector keeps no other account's plan label"
+rm -rf "$test_tmp/omp-report.json" "$test_tmp/.omp" "$test_tmp/.pi/agent/auth.json"
+
 # opencode files any Google sign-in under "google"; only the Antigravity
 # plugin's accounts file makes it an Antigravity one.
 rm -rf "$test_tmp/.omp" "$test_tmp/cache"
@@ -155,7 +188,7 @@ pass "Antigravity collector reads opencode's Antigravity plugin sign-in only wit
 printf '{"google":{"type":"oauth","access":"switched-token","refresh":"switched|p","expires":%s}}\n' "$(in_ms 3600)" \
   >"$test_tmp/.local/share/opencode/auth.json"
 record=$(collect "")
-[[ $(jq -c '{limits, tierLabel, usageStatusText}' <<<"$record") == '{"limits":[],"tierLabel":"","usageStatusText":"Sign-in expired"}' ]] ||
+[[ $(jq -c '{limits, tierLabel, usageStatusText}' <<<"$record") == '{"limits":[],"tierLabel":"","usageStatusText":"Antigravity sign-in expired"}' ]] ||
   fail "Antigravity collector drops kept limits when the account cannot be matched" "$record"
 pass "Antigravity collector drops kept limits when the account cannot be matched"
 
