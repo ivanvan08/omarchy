@@ -50,7 +50,8 @@ pi_login() {
 collect() {
   env -u PI_CODING_AGENT_DIR -u OPENCLAW_STATE_DIR -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
     HOME="$test_tmp" XDG_CACHE_HOME="$test_tmp/cache" PATH="$test_tmp/bin:$PATH" \
-    COLLECTOR="$COLLECTOR" ACCEPTED="$1" ASKED="$test_tmp/asked" python3 - <<'PY'
+    CLOUD_CODE_URL="${2:-}" COLLECTOR="$COLLECTOR" ACCEPTED="$1" ASKED="$test_tmp/asked" \
+    HOSTS="$test_tmp/hosts" python3 - <<'PY'
 import importlib.machinery, importlib.util, io, json, os, sys, urllib.error
 
 loader = importlib.machinery.SourceFileLoader("collector", os.environ["COLLECTOR"])
@@ -76,6 +77,8 @@ def urlopen(request, timeout=None):
   token = request.get_header("Authorization").removeprefix("Bearer ")
   with open(os.environ["ASKED"], "a") as asked:
     asked.write(token + "\n")
+  with open(os.environ["HOSTS"], "a") as hosts:
+    hosts.write(request.full_url.split("/")[2] + "\n")
   if token not in os.environ["ACCEPTED"].split():
     raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, io.BytesIO())
   endpoint = request.full_url.rsplit(":", 1)[1]
@@ -92,12 +95,28 @@ asked() {
   rm -f "$test_tmp/asked"
 }
 
+hosts() {
+  sort -u "$test_tmp/hosts" 2>/dev/null | paste -sd' '
+  rm -f "$test_tmp/hosts"
+}
+
 omp_login omp-token "$(in_ms 3600)" me@example.com
 record=$(collect omp-token)
 [[ $(jq -c '{ready, tierLabel, stale: .limitsStale, percent: .limits[0].percent}' <<<"$record") == '{"ready":true,"tierLabel":"Pro","stale":false,"percent":0.25}' ]] ||
   fail "Antigravity collector reports limits from an omp sign-in without agy" "$record"
 [[ $(asked) == "omp-token" ]] || fail "Antigravity collector asks Google with omp's token" "$record"
 pass "Antigravity collector reports limits from an omp sign-in without agy"
+
+# The bearer token can come from another harness' store, so a destination
+# named in the environment is taken only over https.
+record=$(collect omp-token "http://evil.example")
+[[ $(hosts) == "daily-cloudcode-pa.googleapis.com" && $(jq '.limits[0].percent' <<<"$record") == "0.25" ]] ||
+  fail "Antigravity collector ignores a plain-http destination" "$record"
+record=$(collect omp-token "https://mirror.example")
+[[ $(hosts) == "mirror.example" && $(jq '.limits[0].percent' <<<"$record") == "0.25" ]] ||
+  fail "Antigravity collector honors an https destination" "$record"
+asked >/dev/null
+pass "Antigravity collector asks only an https destination, defaulting to Google's"
 
 pi_login pi-token "$(in_ms 7200)" me@example.com
 record=$(collect "omp-token pi-token")
