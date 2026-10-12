@@ -51,7 +51,7 @@ LIMITS_ONLY_SCAN_REUSE_SECONDS = 900
 # Where the plan and quota are asked for. The bearer token can now come from
 # another harness' store, so a destination named in the environment is taken
 # only over https, and anything else falls back to Google's own endpoint.
-CLOUD_CODE_URL = "https://daily-cloudcode-pa.googleapis.com"
+DEFAULT_CLOUD_CODE_URL = "https://daily-cloudcode-pa.googleapis.com"
 
 
 def app_root():
@@ -307,9 +307,9 @@ def extract_limits(data):
 
 
 def post(endpoint, token):
-  base = (os.environ.get("CLOUD_CODE_URL") or CLOUD_CODE_URL).rstrip("/")
+  base = (os.environ.get("CLOUD_CODE_URL") or DEFAULT_CLOUD_CODE_URL).rstrip("/")
   if not base.startswith("https://"):
-    base = CLOUD_CODE_URL
+    base = DEFAULT_CLOUD_CODE_URL
   request = urllib.request.Request(
     f"{base}/v1internal:{endpoint}", data=b"{}",
     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "antigravity"},
