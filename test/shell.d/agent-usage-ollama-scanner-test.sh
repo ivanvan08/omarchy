@@ -18,6 +18,8 @@ agent_sandbox
 python3 - <<'PY'
 from agent_usage_fixtures import *
 
+import sqlite3
+
 # The checks below compare today's totals with rows stamped now.
 freeze_today()
 USAGE = "ollama.com/api/usage"
@@ -178,4 +180,67 @@ pi_auth(None, "ollama-cloud", "$OLLAMA_KEY")
 expect("Ollama passes over pi's $VAR entry to omp's key", load_collector("ollama").api_key(), "omp-key")
 pi_auth(home() / ".omp" / "agent", "ollama-cloud", "!pass show ollama")
 expect("Ollama never sends a pi $VAR or !command entry as a key", load_collector("ollama").api_key(), "")
+
+# omp keeps the key it signed in with in its agent.db, never in an auth.json;
+# a key it disabled is passed over, and PI_CODING_AGENT_DIR moves the
+# database with the rest of omp's tree.
+def omp_key(directory, *rows):
+  database = Path(directory) / "agent.db"
+  database.parent.mkdir(parents=True, exist_ok=True)
+  conn = sqlite3.connect(database)
+  conn.execute("CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT, credential_type TEXT, data TEXT, disabled_cause TEXT)")
+  for provider, key, disabled in rows:
+    conn.execute("INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause) VALUES (?, 'api_key', ?, ?)",
+                 (provider, json.dumps({"key": key, "source": "login"}), disabled))
+  conn.commit()
+  conn.close()
+
+
+sandbox()
+omp_key(home() / ".omp" / "agent", ("ollama-cloud", "omp-db-key", None), ("ollama-cloud", "revoked-key", "revoked"), ("zai", "zai-key", None))
+pi_auth(home() / ".omp" / "agent", "ollama-cloud", "omp-json-key")
+expect("Ollama asks with the key omp keeps in its agent.db, passing over a disabled one", load_collector("ollama").api_key(), "omp-db-key")
+sandbox()
+omp_key(home() / "moved", ("ollama-cloud", "moved-key", None))
+os.environ["PI_CODING_AGENT_DIR"] = str(home() / "moved")
+expect("Ollama finds omp's agent.db where PI_CODING_AGENT_DIR puts it", load_collector("ollama").api_key(), "moved-key")
+
+# ------------------------------------------------------------- the credits
+
+# A plan on Ollama's credit pricing answers with the dollars spent and no
+# windows. The plan's monthly credit, from Ollama's pricing, is the funded
+# side, an estimate since the credit resets on a day the API doesn't name; a
+# spend past it stops the balance at zero; a plan with no published credit
+# shows none, and none of it is trouble.
+sandbox()
+os.environ["OLLAMA_API_KEY"] = "key"
+CREDITS = {"range": "30d", "scope": "self", "totals": {"request_count": 40, "usage_usd": 12.5, "input_tokens": 9000, "cached_input_tokens": 100, "output_tokens": 800}, "buckets": []}
+with FakeHttp({USAGE: CREDITS, ME: {"Plan": "pro"}}) as http:
+  record = collect("ollama", "--force")
+expect("Ollama shows a credit plan's spend against its monthly credit, asking for the last 30 days",
+       [record["tierLabel"], record["limits"], record["usageStatusText"], record["limitsStale"], record.get("balance"),
+        [request["url"] for request in http.requests if USAGE in request["url"]]],
+       ["Pro", [], "", False, {"remaining": 47.5, "funded": 60.0, "spent": 12.5, "currency": "USD", "estimated": True},
+        ["https://ollama.com/api/usage?range=30d"]], record)
+
+record = ollama("--limits-only", routes={USAGE: CREDITS, ME: {"Plan": "pro"}})
+expect("Ollama reuses a recent credit answer, which has no windows", [ollama.requests, record["balance"]["spent"]], [0, 12.5], record)
+
+record = ollama("--force", mode="down")
+expect("Ollama keeps a credit plan's balance past a failed check", [record.get("balance", {}).get("remaining"), record["limitsStale"], record["usageStatusText"]],
+       [47.5, True, ""], record)
+
+record = ollama(routes={USAGE: {**CREDITS, "totals": {"usage_usd": 75}}, ME: {"Plan": "max"}})
+expect("Ollama measures Max against its own credit", record.get("balance"),
+       {"remaining": 225.0, "funded": 300.0, "spent": 75.0, "currency": "USD", "estimated": True}, record)
+record = ollama(routes={USAGE: {**CREDITS, "totals": {"usage_usd": 75}}, ME: {"Plan": "pro"}})
+expect("Ollama stops a spend past the credit at an empty balance", record.get("balance", {}).get("remaining"), 0.0, record)
+
+record = ollama(routes={USAGE: CREDITS, ME: {"Plan": "free"}})
+expect("Ollama shows a plan with no published credit without a balance or trouble",
+       ["balance" in record, record["tierLabel"], record["usageStatusText"], record["ready"]], [False, "Free", "", True], record)
+
+record = ollama(routes={USAGE: {**CREDITS, "totals": {"usage_usd": "lots"}}, ME: {"Plan": "pro"}})
+expect("Ollama reports a credit answer without a usable spend", ["balance" in record, record["usageStatusText"]],
+       [False, "Ollama limits unavailable"], record)
 PY
