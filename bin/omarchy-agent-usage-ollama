@@ -329,13 +329,15 @@ def collect_limits(access_key: str, force: bool) -> dict[str, Any]:
     result["retryAdvised"] = True
   result["authHelpText"] = probe["helpText"]
   fallback, fetched_at = cache.kept()
+  # A kept credit answer stands with or without a balance, so Free keeps its plan.
+  kept_credits = not fallback and cache.data.get("credits") is True
   if fallback:
     result.update(limits=fallback, tierLabel=cached_plan, fetchedAtMs=fetched_at)
-  elif cached_balance:
+  elif kept_credits:
     result.update(balance=cached_balance, tierLabel=cached_plan, fetchedAtMs=cache.fetched_at)
   if probe.get("auth"):
     result["usageStatusText"] = "Sign-in expired"
-  elif not fallback and not cached_balance:
+  elif not fallback and not kept_credits:
     result["usageStatusText"] = "Ollama limits unavailable"
   return result
 

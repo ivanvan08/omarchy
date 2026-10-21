@@ -239,7 +239,12 @@ expect("Ollama stops a spend past the credit at an empty balance", record.get("b
 record = ollama(routes={USAGE: CREDITS, ME: {"Plan": "free"}})
 expect("Ollama shows a plan with no published credit without a balance or trouble",
        ["balance" in record, record["tierLabel"], record["usageStatusText"], record["ready"]], [False, "Free", "", True], record)
+record = ollama(mode="down")
+expect("Ollama keeps a Free plan past a failed check", ["balance" in record, record["tierLabel"], record["usageStatusText"]],
+       [False, "Free", ""], record)
 
+sandbox()
+os.environ["OLLAMA_API_KEY"] = "key"
 record = ollama(routes={USAGE: {**CREDITS, "totals": {"usage_usd": "lots"}}, ME: {"Plan": "pro"}})
 expect("Ollama reports a credit answer without a usable spend", ["balance" in record, record["usageStatusText"]],
        [False, "Ollama limits unavailable"], record)
