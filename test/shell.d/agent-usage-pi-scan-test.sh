@@ -22,7 +22,7 @@ WORK="$WORK" python3 - <<'PY'
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -133,4 +133,35 @@ rows, complete = scan("other1")
 check("another provider's scan parses only its own ten files",
       complete and len(parsed["files"]) == 10 and all(name.startswith("other-") for name in parsed["files"]) and len(rows) == 30,
       json.dumps({"files": sorted(parsed["files"]), "rows": len(rows)}))
+# A prompt goes with the reply that answered it, even one rg's pattern keeps
+# out of the parse: another provider's reply after a handoff answered it, and
+# the next reply here answers none.
+turns = work / "turns"
+write(turns / "handoff.jsonl", [
+  {"type": "model_change", "id": "hm", "timestamp": stamp, "provider": "demo", "modelId": "demo-model"},
+  {"type": "message", "id": "hu", "timestamp": stamp, "message": {"role": "user", "content": "ask the other one"}},
+  {"type": "message", "id": "ho", "timestamp": stamp, "message": {"role": "assistant", "provider": "elsewhere", "model": "e", "usage": usage(300)}},
+  {"type": "message", "id": "hd", "timestamp": stamp, "message": {"role": "assistant", "provider": "demo", "model": "demo-model", "usage": usage(30)}},
+])
+rows, _ = collectors.scan_pi_sessions(r'"provider"\s*:\s*"demo"', lambda name, model, entry: name == "demo", roots=[turns])
+check("a prompt another provider answered is not booked on the next reply here",
+      [(row.input_tokens, row.prompts) for row in rows] == [(30, 0)], json.dumps([row._asdict() for row in rows]))
+
+# A prompt counts on the day it was typed, not the day its reply came, and
+# one whose time can't be trusted counts nowhere.
+yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+dated = work / "dated"
+write(dated / "midnight.jsonl", [
+  {"type": "model_change", "id": "dm", "timestamp": stamp, "provider": "demo", "modelId": "demo-model"},
+  {"type": "message", "id": "du", "timestamp": yesterday, "message": {"role": "user", "content": "late"}},
+  {"type": "message", "id": "da", "timestamp": stamp, "message": {"role": "assistant", "provider": "demo", "model": "demo-model", "usage": usage(40)}},
+  {"type": "message", "id": "dx", "timestamp": 0, "message": {"role": "user", "content": "untimed"}},
+  {"type": "message", "id": "db", "timestamp": stamp, "message": {"role": "assistant", "provider": "demo", "model": "demo-model", "usage": usage(50)}},
+])
+rows, _ = collectors.scan_pi_sessions(r'"provider"\s*:\s*"demo"', lambda name, model, entry: name == "demo", roots=[dated])
+today = collectors.local_day(stamp)
+check("a prompt counts on its own day, and an untimed one not at all",
+      sorted((row.day, row.input_tokens, row.prompts) for row in rows)
+      == sorted([(collectors.local_day(yesterday), 0, 1), (today, 40, 0), (today, 50, 0)]),
+      json.dumps([row._asdict() for row in rows]))
 PY

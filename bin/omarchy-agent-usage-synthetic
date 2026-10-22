@@ -285,7 +285,8 @@ def main():
     AGENT_ID,
     AGENT_NAME,
     ready=in_use or bool(key),
-    hasLocalStats=True,
+    # A key with no sessions here has no local stats to show.
+    hasLocalStats=number(stats.get("totalSessions")) > 0 or in_use or bool(stats.get("modelUsage")),
     # The quotas answer names no plan.
     tierLabel="",
     usageStatusText=limits["usageStatusText"],

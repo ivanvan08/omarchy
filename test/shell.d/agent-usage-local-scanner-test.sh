@@ -304,4 +304,25 @@ def add_session():
 
 
 check_scan_cache(Adapter("local", grow=add_session, pi_root=lambda: home() / ".pi" / "agent" / "sessions"))
+
+# A harness's route config can move its rows onto this machine without its
+# store changing, so the cached scan is kept only while every harness still
+# classifies the same way, and the match has to survive the cache's JSON.
+import collectors as shared  # noqa: E402
+
+sandbox()
+local = load_collector("local")
+before = local.harness_match()
+(home() / ".qwen").mkdir(parents=True, exist_ok=True)
+(home() / ".qwen" / ".env").write_text("OPENAI_BASE_URL=http://127.0.0.1:8080/v1\n")
+after = local.harness_match()
+expect("a harness route change changes local's scan match, which survives JSON",
+       [before != after, json.loads(json.dumps(after)) == after], [True, True], after)
+real_routes = shared.mcode_routes
+shared.mcode_routes = lambda data_dir=None: {"mine": "local", "gateway": "openrouter"}
+try:
+  routes = shared.mcode_scan_match()
+finally:
+  shared.mcode_routes = real_routes
+expect("MiniMax Code's route match survives the cache's JSON round trip", json.loads(json.dumps(routes)), routes, routes)
 PY

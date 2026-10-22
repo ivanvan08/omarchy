@@ -56,6 +56,14 @@ def chats(project="p"):
   return home() / ".qwen" / "projects" / project / "chats"
 
 
+# Qwen Code sends an OpenAI-compatible reply to OPENAI_BASE_URL, else to
+# OpenAI's API, its default. The checks that aren't about routes run Qwen Code
+# pointed at Model Studio, as from the shell it was started in.
+def studio():
+  sandbox()
+  os.environ["OPENAI_BASE_URL"] = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+
 # A machine that never ran Qwen Code has no local stats to show.
 sandbox()
 record = qwen()
@@ -63,7 +71,7 @@ expect("Qwen with no usage says it has no local stats", [record["ready"], record
 
 # ------------------------------------------------------------- transcripts
 
-sandbox()
+studio()
 transcript(chats("-home-me-app") / "s1.jsonl", [
   prompt("u1", "s1", NOW),
   response("r1", "s1", NOW, "qwen3-coder-plus", "qwen-oauth", 1000, 200, 600, 50, "resp-1"),
@@ -104,7 +112,7 @@ expect("Qwen reads tokens the way Qwen Code's own statistics do", record["modelU
 # already include reasoning_tokens, with and without a total, and a record
 # kept without its auth type, with a total: thinking the total already holds
 # in the output counts once.
-sandbox()
+studio()
 transcript(chats() / "r.jsonl", [
   prompt("u1", "r", NOW),
   response("r1", "r", NOW, "qwen-resp-model", "openai-responses", 5234, 55, 75, 5, "resp_mock5", total=5289),
@@ -123,8 +131,10 @@ expect("Qwen counts a Responses API reply's reasoning once, and other thinking o
 # and settings.json's modelProviders the base URL each model is sent to:
 # Alibaba's hosts are Qwen's, OpenRouter's or a self-hosted server's are
 # theirs, and Anthropic's API, which Qwen Code reaches with --auth-type
-# anthropic, is no Qwen plan. Each prompt goes with the reply that answered
-# it. Shaped as Qwen Code 0.26.0 wrote them against a mock of each API.
+# anthropic, is no Qwen plan, nor OpenAI's, where Qwen Code sends a model no
+# route or OPENAI_BASE_URL places. Each prompt goes with the reply that
+# answered it. Shaped as Qwen Code 0.26.0 wrote them against a mock of each
+# API.
 sandbox()
 write_json(home() / ".qwen" / "settings.json", {"modelProviders": {"openai": [
   {"id": "qwen3-coder-plus", "baseUrl": "https://coding-intl.dashscope.aliyuncs.com/v1", "envKey": "BAILIAN_CODING_PLAN_API_KEY"},
@@ -144,16 +154,104 @@ transcript(chats() / "routes.jsonl", [
   response("r5", "routes", NOW, "qwen-unlisted", "openai", 100, 10, 0, 0, "chatcmpl-default"),
 ])
 record = qwen()
-expect("Qwen counts the replies Alibaba billed or nothing places, with their prompts, and leaves other providers' out",
+expect("Qwen counts the replies Alibaba billed, with their prompts, and leaves other providers' out",
        [sorted(record["modelUsage"]), record["todayPrompts"], record["todayTotalTokens"]],
-       [["qwen-unlisted", "qwen3-coder-plus"], 2, 1285 + 110], record)
+       [["qwen3-coder-plus"], 1, 1285], record)
 local = collect("local", "--force")
 expect("Local counts the Qwen Code replies sent to a self-hosted server",
        [local["todayTokensByModel"], local["todayPrompts"]], [{"local-qwen": 3030}, 1], local)
 
+
+# A request no reply answered, as Qwen Code logs it: a ui_telemetry api_error
+# event naming the model and auth type it was sent with.
+def failed(uuid, session, timestamp, model, auth, execution):
+  event = {"event.name": "qwen-code.api_error", "event.timestamp": timestamp, "response_id": "", "execution_id": execution, "model": model, "duration_ms": 2990,
+           "prompt_id": f"{session}########0", "auth_type": auth, "error_message": "Connection error. (cause: connect ECONNREFUSED 127.0.0.1:18499)", "error_type": "APIConnectionError"}
+  return {"uuid": uuid, "sessionId": session, "timestamp": timestamp, "type": "system", "subtype": "ui_telemetry", "systemPayload": {"uiEvent": event}}
+
+
+# A prompt no reply answered goes where its requests were sent, else where
+# settings.json's selected model goes: a server you run that refused them all
+# is local's, not Qwen's. Shaped as Qwen Code 0.26.0 wrote a run against a
+# dead port on a modelProviders route.
+sandbox()
+write_json(home() / ".qwen" / "settings.json", {
+  "modelProviders": {"openai": [{"id": "qwen-dead-model", "name": "dead", "baseUrl": "http://127.0.0.1:18499/v1", "envKey": "MOCK_QWEN_KEY"},
+                                {"id": "qwen3-coder-plus", "baseUrl": "https://coding-intl.dashscope.aliyuncs.com/v1"}]},
+  "security": {"auth": {"selectedType": "openai"}},
+  "model": {"name": "qwen-dead-model"},
+})
+transcript(chats() / "93e3e301.jsonl", [
+  prompt("f5316beb", "93e3e301", NOW),
+  failed("1e40dc03", "93e3e301", NOW, "qwen-dead-model", "openai", "cb1ab8b5"),
+  failed("a76f1d2f", "93e3e301", NOW, "qwen-dead-model", "openai", "0746ab80"),
+])
+transcript(chats() / "plan.jsonl", [prompt("p1", "plan", NOW), failed("p2", "plan", NOW, "qwen3-coder-plus", "openai", "e1")])
+# Typed, and stopped before any request: the selected model's route decides.
+transcript(chats() / "bare.jsonl", [prompt("b1", "bare", NOW)])
+records = {cid: collect(cid, "--force") for cid in ("qwen", "local")}
+expect("a Qwen Code prompt no reply answered counts where its route goes",
+       {cid: [record["todayPrompts"], record["todaySessions"], record["todayTotalTokens"]] for cid, record in records.items()},
+       {"qwen": [1, 1, 0], "local": [2, 2, 0]}, records)
+
+# A scan answers only for the routes it was made under: a route moved after
+# it is reflected at once, even on a --limits-only run. As Qwen Code 0.26.0
+# wrote a run against a server of the user's own.
+def env_run():
+  sandbox()
+  transcript(chats() / "env.jsonl", [
+    prompt("54ccea9a", "env", NOW),
+    response("e1", "env", NOW, "qwen-env-model", "openai", 6309, 55, 75, 0, "chatcmpl-mock405", total=6364),
+    response("e2", "env", NOW, "qwen-env-model", "openai", 7310, 56, 76, 0, "chatcmpl-mock406", total=7366),
+  ])
+
+
+env_run()
+write_json(home() / ".qwen" / "settings.json", {"modelProviders": {"openai": [{"id": "qwen-env-model", "baseUrl": "http://127.0.0.1:18491/v1"}]}})
+expect("Qwen leaves out a reply its route sends to a server of the user's own", collect("qwen")["todayTotalTokens"], 0)
+write_json(home() / ".qwen" / "settings.json", {"modelProviders": {"openai": [{"id": "qwen-env-model", "baseUrl": "https://coding-intl.dashscope.aliyuncs.com/v1"}]}})
+expect("a Qwen scan made before a modelProviders route moved is not reused after it", collect("qwen", "--limits-only")["todayTotalTokens"], 13730)
+
+# A model no modelProviders route names is sent where OPENAI_BASE_URL (or
+# ANTHROPIC_BASE_URL) says, which Qwen Code takes from the first .env file
+# setting it (its home's, then ~/.env), else from settings.json's env, else
+# from the security.auth.baseUrl /auth saved.
+env_run()
+ENV_ROUTES = [
+  ("~/.qwen/.env", lambda: (home() / ".qwen" / ".env").write_text("OPENAI_API_KEY=sk-dummy\nexport OPENAI_BASE_URL=\"http://127.0.0.1:18491/v1\"  # mock\nOPENAI_MODEL=qwen-env-model\n"), "local"),
+  ("~/.env", lambda: (home() / ".env").write_text("OPENAI_BASE_URL=http://127.0.0.1:18491/v1\n"), "local"),
+  ("settings.json env", lambda: write_json(home() / ".qwen" / "settings.json", {"env": {"OPENAI_BASE_URL": "http://192.168.1.20:8000/v1"}}), "local"),
+  ("security.auth.baseUrl", lambda: write_json(home() / ".qwen" / "settings.json", {"security": {"auth": {"selectedType": "openai", "baseUrl": "http://127.0.0.1:18491/v1"}}}), "local"),
+  ("settings.json env, OpenRouter", lambda: write_json(home() / ".qwen" / "settings.json", {"env": {"OPENAI_BASE_URL": "https://openrouter.ai/api/v1"}}), None),
+  ("settings.json env, Model Studio", lambda: write_json(home() / ".qwen" / "settings.json", {"env": {"OPENAI_BASE_URL": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"}}), "qwen"),
+  # The first .env file wins over settings.json's env.
+  ("~/.qwen/.env over settings.json env", lambda: ((home() / ".qwen" / ".env").write_text("OPENAI_BASE_URL=http://127.0.0.1:18491/v1\n"),
+   write_json(home() / ".qwen" / "settings.json", {"env": {"OPENAI_BASE_URL": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"}})), "local"),
+]
+
+
+def clear_routes():
+  for path in (home() / ".qwen" / ".env", home() / ".env", home() / ".qwen" / "settings.json"):
+    path.unlink(missing_ok=True)
+
+
+for where, configure, owner in ENV_ROUTES:
+  clear_routes()
+  configure()
+  records = {cid: collect(cid, "--force") for cid in ("qwen", "local")}
+  expect(f"a Qwen Code reply sent where {where} says counts under {owner or 'nobody'}",
+         {cid: [record["todayTotalTokens"], record["todayPrompts"]] for cid, record in records.items()},
+         {cid: [13730, 1] if cid == owner else [0, 0] for cid in records}, records)
+
+# A .env route set after a scan is reflected at once too.
+clear_routes()
+expect("Qwen leaves out an OpenAI-compatible reply with no route, which went to OpenAI's API", collect("qwen")["todayTotalTokens"], 0)
+(home() / ".qwen" / ".env").write_text("OPENAI_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1\n")
+expect("a Qwen scan made before a .env route is not reused after it", collect("qwen", "--limits-only")["todayTotalTokens"], 13730)
+
 # --------------------------------------------------------- untrusted fields
 
-sandbox()
+studio()
 transcript(chats() / "s.jsonl", [
   prompt("bad1", "s", "yesterday-ish"),
   prompt("bad2", "s", "2999-01-01T00:00:00Z"),
@@ -172,7 +270,7 @@ expect("Qwen skips bad times, bad token fields, a line nested too deep, and a to
 
 # A record with no time is dated once, by the transcript's time as it is
 # read, so it isn't today's again on every day after.
-sandbox()
+studio()
 undated = transcript(chats() / "u.jsonl", [prompt("nt1", "u", None), response("nt2", "u", None, "m", "openai", 10, 2, 0, 0, "nt")])
 three_days_ago = time.time() - 3 * 86400
 os.utime(undated, (three_days_ago, three_days_ago))
@@ -183,7 +281,7 @@ expect("an undated record is dated by its transcript, once",
 
 # ---------------------------------------------------------------- locations
 
-sandbox()
+studio()
 transcript(home() / "runtime" / "projects" / "p" / "chats" / "s.jsonl", [response("a", "s", NOW, "m", "openai", 1, 0, 0, 0, "ra")])
 transcript(home() / "qhome" / "projects" / "p" / "chats" / "s.jsonl", [response("b", "s", NOW, "m", "openai", 10, 0, 0, 0, "rb")])
 transcript(chats() / "s.jsonl", [response("c", "s", NOW, "m", "openai", 100, 0, 0, 0, "rc")])
@@ -207,7 +305,7 @@ expect("Qwen ignores a runtimeOutputDir holding a NUL", record["todayTotalTokens
 # pi, omp and opencode turns on Alibaba's Qwen plans count beside Qwen Code's
 # own transcripts: every plan id once, and nothing on a pay-as-you-go key, a
 # custom gateway that only starts with a plan's name, or a bare `qwen`.
-sandbox()
+studio()
 PLAN_IDS = ["alibaba-coding-plan", "alibaba-coding-plan-cn", "alibaba-token-plan", "alibaba-token-plan-cn",
             "qwen-token-plan", "qwen-token-plan-cn", "qwen-token-plan-individual", "qwen-portal"]
 OTHER_IDS = ["alibaba", "alibaba-cn", "alibaba-coding-plan-proxy", "qwen", "dashscope"]
@@ -242,7 +340,7 @@ expect("Qwen shows Qwen plan usage without Qwen Code transcripts or a sign-in",
 
 # ---------------------------------------------------------------- contract
 
-sandbox()
+studio()
 
 
 def add_response():

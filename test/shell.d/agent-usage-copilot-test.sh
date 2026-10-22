@@ -479,5 +479,5 @@ transcript("sess-byok", [("user.message", {"content": "Say hi"}, NOW),
                          ("session.shutdown", {"modelMetrics": {"mock-model": {"usage": {"inputTokens": 21372, "outputTokens": 251}}}}, NOW)])
 record = copilot()
 expect("a store of custom-provider requests alone leaves Copilot empty",
-       [record["ready"], record["totalPrompts"], record["todayTotalTokens"]], [False, 0, 0], record)
+       [record["ready"], record["hasLocalStats"], record["totalPrompts"], record["todayTotalTokens"]], [False, False, 0, 0], record)
 PY

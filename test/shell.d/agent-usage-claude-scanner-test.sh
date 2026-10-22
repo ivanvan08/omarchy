@@ -528,6 +528,44 @@ expect("Claude's stats-cache fallback gives seven days of tokens and trusted mod
   {"claude-opus": {"inputTokens": 10, "outputTokens": 0, "cacheReadInputTokens": 7, "cacheCreationInputTokens": 0}},
 ], record)
 
+# history.jsonl as interactive Claude Code 2.1.308 wrote it: two typed
+# prompts, /model and /exit (built-ins that ask the model nothing, with and
+# without arguments), a custom command, and a prompt typed while a turn ran.
+def history_line(display, session):
+  return {"display": display, "pastedContents": {}, "timestamp": ms_in(0), "project": "/home/me/proj", "sessionId": session}
+
+
+HISTORY = [history_line("tuihello", "s1"), history_line("tuisecond", "s1"), history_line("/model opus", "s1"), history_line("/exit", "s1"),
+           history_line("/mycmd", "s2"), history_line("queuedtwo", "s2"), history_line("/exit", "s2")]
+
+# Without transcripts, history.jsonl's built-in commands are no prompts.
+sandbox()
+(home() / ".claude").mkdir()
+(home() / ".claude" / "history.jsonl").write_text("".join(json.dumps(line) + "\n" for line in HISTORY))
+record = claude()
+expect("Claude's history.jsonl fallback counts no built-in local command", [record["todayPrompts"], record["todaySessions"]], [4, 2], record)
+
+# Sent to Z.ai, those prompts were Z.ai's, and neither file says otherwise.
+write_json(home() / ".claude" / "settings.json", {"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}})
+write_json(home() / ".claude" / "stats-cache.json", {"totalMessages": 40, "totalSessions": 3, "dailyActivity": [{"date": datetime.now().date().isoformat(), "messageCount": 4}]})
+record = claude()
+expect("Claude sent to Z.ai takes no prompts or sessions from its fallbacks",
+       [record["todayPrompts"], record["todaySessions"], record["totalPrompts"], record["totalSessions"], record["activeDays"]], [0, 0, 0, 0, 0], record)
+
+# Transcripts whose every reply another provider served were counted by that
+# provider's collector, prompts included: the fallbacks are not read again.
+(home() / ".claude" / "settings.json").unlink()
+transcript(
+  {"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": STAMP, "promptSource": "typed", "message": {"role": "user", "content": "tuihello"}},
+  message("glm-1", 10, 5, model="glm-5"),
+)
+for where, settings in (("named by its model", {}), ("sent to Z.ai", {"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}})):
+  write_json(home() / ".claude" / "settings.json", settings)
+  record = claude()
+  expect(f"Claude with only another provider's transcripts ({where}) reads no fallback",
+         [record["ready"], record["todayPrompts"], record["todaySessions"], record["totalPrompts"], record["totalSessions"], record["activeDays"]],
+         [False, 0, 0, 0, 0, 0], record)
+
 # A stats-cache or history line of the wrong shape costs that field or line,
 # never the record.
 sandbox()
@@ -561,6 +599,100 @@ sandbox()
 record = claude()
 expect("Claude asks a signed-out Claude Code home to sign in", [record["ready"], record["usageStatusText"]], [False, "Waiting for auth"], record)
 
+# ------------------------------------------------------------- cost-state
+
+# Claude Code 2.1.308 writes a cost-state line when a process saves its
+# cost: the lineage's startTime, carried through a resume and a
+# --fork-session, and what each model has used in it so far, the requests no
+# reply line records (a /compact, the session title, a side query)
+# included. Shapes as Claude Code wrote them against a mock API that served
+# each request once.
+sandbox()
+YESTERDAY = (fixture_now().astimezone() - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+
+
+def reply(session, message_id, counts, timestamp, model="claude-sonnet-4-5", sidechain=False):
+  return {"parentUuid": None, "isSidechain": sidechain, "type": "assistant", "sessionId": session, "timestamp": timestamp,
+          "requestId": f"req_{message_id}", "uuid": f"uuid-{session}-{message_id}",
+          "message": {"model": model, "id": message_id, "type": "message", "role": "assistant", "content": [{"type": "text", "text": "Hello"}],
+                      "usage": dict(zip(("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"), counts))}}
+
+
+def typed(session, uuid, timestamp, text="Say hello"):
+  return {"parentUuid": None, "isSidechain": False, "type": "user", "promptSource": "sdk", "sessionId": session, "timestamp": timestamp,
+          "uuid": uuid, "message": {"role": "user", "content": text}}
+
+
+def cost_state(session, start, usage):
+  return {"type": "cost-state", "sessionId": session, "totalCostUSD": 0.0046, "totalAPIDuration": 9, "startTime": start,
+          "modelUsage": {model: {"inputTokens": counts[0], "outputTokens": counts[1], "thinkingTokens": 0, "cacheReadInputTokens": counts[2],
+                                 "cacheCreationInputTokens": counts[3], "webSearchRequests": 0, "costUSD": 0.0046}
+                         for model, counts in usage.items()},
+          "hasUnknownModelCost": False}
+
+
+def claude_code_days(owner="claude"):
+  import collectors
+  days = {}
+  for row in collectors.scan_claude_code(owner, projects().parent, base_url=""):
+    by_model = days.setdefault(row.day, {})
+    by_model[row.model] = by_model.get(row.model, 0) + row.input_tokens + row.output_tokens + row.cache_read + row.cache_write
+  return days
+
+
+yesterday, today_day = YESTERDAY[:10], fixture_now().astimezone().date().isoformat()
+# A one-shot run asks for a title too, and is resumed the next day for a
+# /compact, whose request no reply line records.
+compacted = [
+  typed("compact", "u-compact-1", YESTERDAY),
+  reply("compact", "msg_c1", (1234, 51, 71, 31), YESTERDAY),
+  {"type": "last-prompt", "lastPrompt": "Say hello", "sessionId": "compact"},
+  cost_state("compact", 1792669864166, {"claude-sonnet-4-5[1m]": (1234, 51, 71, 31), "claude-haiku-4-5-20251001": (893, 24, 0, 0)}),
+  {"type": "queue-operation", "operation": "enqueue", "timestamp": STAMP, "sessionId": "compact", "content": "/compact"},
+  {"type": "system", "subtype": "compact_boundary", "content": "Conversation compacted", "timestamp": STAMP, "sessionId": "compact",
+   "compactMetadata": {"trigger": "manual", "preTokens": 1387}},
+  {"type": "user", "isCompactSummary": True, "sessionId": "compact", "timestamp": STAMP, "uuid": "u-summary", "message": {"role": "user", "content": "Summary"}},
+  cost_state("compact", 1792669864166, {"claude-sonnet-4-5[1m]": (3002468, 102, 142, 62), "claude-haiku-4-5-20251001": (893, 24, 0, 0)}),
+]
+transcript(*compacted[:4], name="compact.jsonl")
+expect("Claude counts the title query a cost-state holds beyond the replies", claude_code_days(),
+       {yesterday: {"claude-sonnet-4-5": 1387, "claude-haiku-4-5-20251001": 917}})
+transcript(*compacted[4:], name="compact.jsonl", mode="a")
+expect("Claude counts a /compact's request, read from the cost-state appended after it, on the day it ran", claude_code_days(),
+       {yesterday: {"claude-sonnet-4-5": 1387, "claude-haiku-4-5-20251001": 917}, today_day: {"claude-sonnet-4-5": 3001387}})
+index = json.loads(next(cache_root().glob("claude-index-*.json")).read_text())
+(projects() / "compact.jsonl").touch()
+expect("Claude reads a cost-state appended to a transcript as it reads the whole transcript again",
+       [claude_code_days(), [entry["costs"] for entry in json.loads(next(cache_root().glob("claude-index-*.json")).read_text())["files"].values()]],
+       [{yesterday: {"claude-sonnet-4-5": 1387, "claude-haiku-4-5-20251001": 917}, today_day: {"claude-sonnet-4-5": 3001387}},
+        [entry["costs"] for entry in index["files"].values()]])
+
+# A --fork-session carries the lineage on: its cost-state includes the
+# parent's, compaction and all, and its transcript copies the parent's
+# replies under its own session. A subagent runs under its parent's session
+# in a file of its own, and its replies are in the cost-state too. A
+# process still running has replies past its last cost-state.
+sandbox()
+parent = [typed("parent", "u-p1", STAMP), reply("parent", "msg_p1", (101234, 51, 71, 31), STAMP)]
+transcript(*parent, cost_state("parent", 1792669919352, {"claude-sonnet-4-5": (203468, 103, 143, 63)}), name="parent.jsonl")
+transcript(*[{**line, "sessionId": "fork"} for line in parent], typed("fork", "u-f1", STAMP), reply("fork", "msg_f1", (701234, 51, 71, 31), STAMP),
+           cost_state("fork", 1792669919352, {"claude-sonnet-4-5": (904702, 154, 214, 94)}), name="fork.jsonl")
+transcript(typed("main", "u-m1", STAMP), reply("main", "msg_m1", (100, 1, 0, 0), STAMP),
+           cost_state("main", 1792681739702, {"claude-sonnet-4-5": (5600, 6, 0, 0), "claude-haiku-4-5-20251001": (300, 3, 0, 0)}),
+           reply("main", "msg_m2", (90000, 9, 0, 0), today_stamp(13)), name="main.jsonl")
+transcript(reply("main", "msg_s1", (5000, 5, 0, 0), STAMP, sidechain=True), name="main/subagents/agent-a1.jsonl")
+expect("Claude counts a fork's lineage once, a subagent's replies once, and keeps what a running process's cost-state held beyond its replies",
+       claude_code_days(),
+       {today_day: {"claude-sonnet-4-5": 905164 + 101 + 5005 + 500 + 90009, "claude-haiku-4-5-20251001": 303}})
+
+# A gateway can name a model one way in the request and another in the
+# reply: no more counts than the cost-state says beyond every reply.
+sandbox()
+transcript(typed("gw", "u-g1", STAMP), reply("gw", "msg_g1", (500, 5, 0, 0), STAMP, model="claude-sonnet-4-5-20250929"),
+           cost_state("gw", 1792681376828, {"anthropic/claude-sonnet-4.5": (500, 5, 0, 0)}), name="gw.jsonl")
+expect("Claude counts nothing more for a cost-state that names the replies' model another way", claude_code_days(),
+       {today_day: {"claude-sonnet-4-5-20250929": 505}})
+
 # ---------------------------------------------------------------- contract
 
 sandbox()
@@ -572,4 +704,20 @@ def add_message():
 
 
 check_scan_cache(Adapter("claude", grow=add_message, pi_root=lambda: home() / ".pi" / "agent" / "sessions"))
+
+# A scan that couldn't read one of the transcripts isn't kept for the next
+# run, so the missing tokens show as soon as the file can be read.
+if os.geteuid() != 0:
+  sandbox()
+  claude_code_session("seen", [("claude-sonnet-4-5", 300)])
+  locked = claude_code_session("late", [("claude-sonnet-4-5", 40)])
+  locked.chmod(0)
+  try:
+    claude()
+  finally:
+    locked.chmod(0o644)
+  record = claude("--limits-only")
+  expect("Claude does not cache a scan that missed a transcript", record["todayTokensByModel"], {"claude-sonnet-4-5": 340}, record)
+else:
+  print("ok - Claude does not cache a scan that missed a transcript # SKIP root reads anything")
 PY

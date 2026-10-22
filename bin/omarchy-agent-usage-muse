@@ -733,7 +733,8 @@ def main():
     # A sign-in shows even before its first session or window, and so does
     # a Muse CLI waiting for one.
     ready=number(stats.get("totalPrompts")) > 0 or len(limits["limits"]) > 0 or bool(limits.get("signedIn")) or limits["usageStatusText"] != "",
-    hasLocalStats=True,
+    # A sign-in with no sessions here has no local stats to show.
+    hasLocalStats=number(stats.get("totalSessions")) > 0 or number(stats.get("totalPrompts")) > 0 or bool(stats.get("modelUsage")),
     # Prompts and sessions are counted, so the panel shows them in tooltips.
     hasPromptStats=True,
     tierLabel=limits["tierLabel"],

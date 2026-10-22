@@ -170,6 +170,8 @@ for url in ("http://evil.example", "not a url"):
     record = collect("synthetic", "--force")
   expect(f"Synthetic sends its key to no untrusted endpoint ({url})",
          [http.count, record["usageStatusText"], "HTTPS" in record["authHelpText"]], [0, "Synthetic limits unavailable", True], record)
+  expect(f"a Synthetic key with no sessions here has no local stats ({url})",
+         [record["ready"], record["totalSessions"], record["hasLocalStats"]], [True, 0, False], record)
 del os.environ["SYNTHETIC_API_KEY"], os.environ["SYNTHETIC_API_BASE_URL"]
 
 # ------------------------------------------------------------ local stats
@@ -183,4 +185,5 @@ record = synthetic()
 expect("Synthetic names its Hugging Face models by their last part", sorted(record["modelUsage"]), ["GLM-4.6", "Kimi-K2"], record)
 expect("Synthetic in use without a key waits for auth",
        [record["ready"], record["usageStatusText"], record["limits"]], [True, "Waiting for auth", []], record)
+expect("Synthetic's sessions here are local stats", record["hasLocalStats"], True, record)
 PY

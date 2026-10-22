@@ -459,7 +459,9 @@ def build_record(stats, unreadable):
   signed_in = credentials_path().is_file()
   in_use = number(stats.get("totalPrompts")) > 0 or bool(stats.get("modelUsage"))
 
-  record = base_record(AGENT_ID, AGENT_NAME, ready=in_use or signed_in or bool(quota and quota["limits"]), hasLocalStats=True)
+  # A sign-in with no sessions here has no local stats to show.
+  local = in_use or number(stats.get("totalSessions")) > 0
+  record = base_record(AGENT_ID, AGENT_NAME, ready=in_use or signed_in or bool(quota and quota["limits"]), hasLocalStats=local)
   if quota:
     record.update(quota)
   elif signed_in:

@@ -123,6 +123,7 @@ expect("Muse stays silent for an active plan without usage windows",
        [plan["limits"], plan["tierLabel"], plan["usageStatusText"], plan["authHelpText"], "retryAdvised" in plan],
        [[], "Muse Code Everyday Usage", "", "", False], plan)
 expect("a Muse sign-in shows before its first session, pay-as-you-go included", [payg["ready"], plan["ready"]], [True, True])
+expect("a Muse sign-in with no sessions here has no local stats", [payg["hasLocalStats"], plan["hasLocalStats"]], [False, False])
 
 # A plan that moved to pay-as-you-go leaves its old windows behind: a failed
 # check after that brings none of them back. The answer is reused like any

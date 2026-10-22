@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -493,9 +494,11 @@ def billed_here(provider: str, model: str, entry: dict) -> bool:
 # Kimi Code logs each agent of a session, subagents included, to its own
 # append-only sessions/<workspace>/<session>/agents/<agent>/wire.jsonl: a
 # usage.record for every model request it made, compactions included, the
-# input its user gave (turn.prompt, or turn.steer into a running turn), and,
-# at the end of a fork's copy of its source's records, a forked marker.
-WIRE_TYPES = (b'"usage.record"', b'"turn.prompt"', b'"turn.steer"', b'"forked"')
+# input its user gave (turn.prompt, or turn.steer into a running turn), the
+# model alias an agent is bound to (profile.bind) and each request is sent on
+# (llm.request), answered or not, and, at the end of a fork's copy of its
+# source's records, a forked marker.
+WIRE_TYPES = (b'"usage.record"', b'"turn.prompt"', b'"turn.steer"', b'"forked"', b'"profile.bind"', b'"llm.request"')
 USAGE_FIELDS = ("inputOther", "output", "inputCacheRead", "inputCacheCreation")
 
 
@@ -508,8 +511,9 @@ def typed(origin: dict[str, Any]) -> bool:
 
 def read_wire(path: Path) -> tuple[bool, list[tuple]]:
   """Whether a wire.jsonl is a fork's, and its rows: ("u", key, day, model,
-  counts) for a request's usage and ("p", key, day) for a typed input. A row
-  whose time can't be trusted is skipped."""
+  counts) for a request's usage, ("p", key, day) for a typed input, and
+  ("b", alias) and ("r", alias) for an alias bound and a request sent on
+  it. A usage or input row whose time can't be trusted is skipped."""
   forked, rows = False, []
   with path.open("rb") as handle:
     for raw in handle:
@@ -524,6 +528,10 @@ def read_wire(path: Path) -> tuple[bool, list[tuple]]:
       kind, time_ms = record.get("type"), record.get("time")
       if kind == "forked":
         forked = True
+        continue
+      alias = record.get("modelAlias")
+      if kind in ("profile.bind", "llm.request") and isinstance(alias, str) and alias.strip():
+        rows.append(("b" if kind == "profile.bind" else "r", alias.strip()))
         continue
       day = local_day(time_ms) if isinstance(time_ms, (int, float)) else None
       if day is None:
@@ -591,11 +599,20 @@ def harness_sources() -> list[Path]:
   return [code_home()]
 
 
+def harness_match() -> dict[str, str]:
+  """What harness_rows() decided owners under, for cached_scan(match=...):
+  config.toml's routes, so a scan made before a route changed never stands in
+  for one after it, in this collector or in local."""
+  routes = json.dumps(sorted(code_routes().items()))
+  return {"kimiCodeRoutes": hashlib.sha256(routes.encode("utf-8", "surrogatepass")).hexdigest()[:16]}
+
+
 def harness_rows(owner: str) -> tuple[list[UsageRow], bool]:
   """Kimi Code's usage that `owner` bills, each request counted once though
   forks copy them, with each typed prompt as a row of its own billed with the
-  request that answered it, and whether every session was read. A prompt no
-  request answered is Kimi Code's own."""
+  next request sent for it, answered or not, else with the alias its agent
+  was bound to, and whether every session was read. A prompt in a log that
+  names neither, from before Kimi Code recorded them, is Kimi Code's own."""
   routes = code_routes()
   complete = True
   wires = []
@@ -613,14 +630,19 @@ def harness_rows(owner: str) -> tuple[list[UsageRow], bool]:
   found = []
   for _, path, rows in wires:
     session = path.parents[2].name
-    answered = AGENT_ID
+    bound, unanswered = AGENT_ID, []
+    for row in rows:
+      if row[0] == "b":
+        bound = route_owner(row[1], routes)
+      unanswered.append(bound)
+    requested, answered = False, None
     owners = []
-    for row in reversed(rows):
-      if row[0] == "u":
-        answered = route_owner(row[3], routes)
-      owners.append(answered)
+    for row, fallback in zip(reversed(rows), reversed(unanswered)):
+      if row[0] in ("u", "r"):
+        requested, answered = True, route_owner(row[3] if row[0] == "u" else row[1], routes)
+      owners.append(answered if requested else fallback)
     for row, billed in zip(rows, reversed(owners)):
-      if (row[0], row[1]) in seen:
+      if row[0] not in ("u", "p") or (row[0], row[1]) in seen:
         continue
       seen.add((row[0], row[1]))
       if billed != owner:
@@ -632,7 +654,7 @@ def harness_rows(owner: str) -> tuple[list[UsageRow], bool]:
   return found, complete
 
 
-def scan() -> tuple[dict[str, Any], bool]:
+def scan(reuse: bool = True) -> tuple[dict[str, Any], bool]:
   """Kimi Code's usage and typed prompts on Kimi's routes, pi, omp and
   opencode sessions on the Kimi Code plan, Claude Code's turns on Kimi
   (pointed at Kimi's or Moonshot's API, or answered by a Kimi model) and
@@ -642,7 +664,7 @@ def scan() -> tuple[dict[str, Any], bool]:
   code_rows, complete = harness_rows(AGENT_ID)
   for row in code_rows:
     stats.add_row(row, row.model)
-  routed_rows, routed_complete = scan_routed(AGENT_ID)
+  routed_rows, routed_complete = scan_routed(AGENT_ID, reuse)
   pi_rows, pi_complete = scan_pi_sessions(r'"provider"\s*:\s*"(' + "|".join(PROVIDERS) + r')"', billed_here)
   # The database's prefilter matches every plan id.
   db_rows, db_complete = scan_opencode(["kimi-cod", "moonshot"], billed_here)
@@ -709,9 +731,11 @@ def main() -> int:
   # The digest covers Kimi Code's home, so another home never reuses this
   # one's numbers, pi's and omp's session roots and opencode's database, and
   # Claude Code's and MiniMax Code's sessions, whose owner depends on where
-  # they are sent.
+  # they are sent, as Kimi Code's does on its routes.
   sources = [code_home(), *pi_session_roots(), opencode_db(), *routed_sources()]
-  stats = cached_scan(AGENT_ID, sources, scan_max_age(args.force, args.limits_only), scan, match=routed_match())
+  # A forced scan reads every Codex rollout again too.
+  max_age = scan_max_age(args.force, args.limits_only)
+  stats = cached_scan(AGENT_ID, sources, max_age, lambda: scan(reuse=max_age > 0), match={**routed_match(), **harness_match()})
   if not in_use() and not stats.get("modelUsage") and not stats.get("totalPrompts"):
     emit(base_record())
     return 0

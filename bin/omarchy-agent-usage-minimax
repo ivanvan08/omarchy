@@ -381,12 +381,12 @@ def billed_here(provider: str, model: str, entry: dict) -> bool:
   return provider in PROVIDERS
 
 
-def scan_sessions() -> tuple[dict[str, Any], bool]:
+def scan_sessions(reuse: bool = True) -> tuple[dict[str, Any], bool]:
   stats = Stats()
   # Every source runs, so one unreadable source still leaves the others.
   # MiniMax Code on MiniMax's own routes or a custom provider at MiniMax's
   # host, and Claude Code pointed at MiniMax or answered by a MiniMax model.
-  routed_rows, routed_complete = scan_routed(AGENT_ID)
+  routed_rows, routed_complete = scan_routed(AGENT_ID, reuse)
   for row in routed_rows:
     stats.add_row(row, row.model or "minimax")
   pattern = r'"provider"\s*:\s*"(' + "|".join(PROVIDERS) + r')"'
@@ -404,7 +404,8 @@ def scan_sessions() -> tuple[dict[str, Any], bool]:
 def cached_local_stats(max_age_seconds: float) -> dict[str, Any]:
   # The digest covers every data path the scan reads.
   sources = [opencode_db(), *pi_session_roots(), *routed_sources()]
-  return cached_scan(AGENT_ID, sources, max_age_seconds, scan_sessions, match=routed_match())
+  # A forced scan reads every Codex rollout again too.
+  return cached_scan(AGENT_ID, sources, max_age_seconds, lambda: scan_sessions(reuse=max_age_seconds > 0), match=routed_match())
 
 
 # --------------------------------------------------------------------------

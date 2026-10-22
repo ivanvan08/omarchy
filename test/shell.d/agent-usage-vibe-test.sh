@@ -218,6 +218,32 @@ with contextlib.redirect_stderr(io.StringIO()):
 expect("Vibe skips a Unified Harness session it cannot read without caching the scan",
        [record["todayTotalTokens"], bool(scan_cache_files("vibe"))], [15, False], record)
 
+# A Unified Harness session goes where config.toml routes its alias now, so a
+# route change reaches the cached scan at once, even on the panel's
+# --limits-only refresh that otherwise reuses a scan for minutes.
+sandbox()
+MISTRAL_TOML = '[[providers]]\nname = "mistral"\napi_base = "{}"\napi_key_env_var = "MISTRAL_API_KEY"\nbackend = "mistral"\n\n[[models]]\nname = "devstral-2"\nprovider = "mistral"\nalias = "devstral-mock"\n'
+(home() / ".vibe").mkdir(parents=True, exist_ok=True)
+(home() / ".vibe" / "config.toml").write_text(MISTRAL_TOML.format("https://api.mistral.ai/v1"))
+write_unified("ses_routed", usage(67000, 896), entries=[message("u1", "user", "turn_start")], alias="devstral-mock")
+before = vibe("--limits-only")
+(home() / ".vibe" / "config.toml").write_text(MISTRAL_TOML.format("http://127.0.0.1:18083/v1"))
+after = vibe("--limits-only")
+expect("a Vibe route change reaches Vibe's cached scan at once",
+       [before["todayTokensByModel"], after["todayTokensByModel"], after["todayPrompts"]], [{"devstral-mock": 67896}, {}, 0], after)
+
+# A session whose alias config.toml no longer names isn't Mistral's because
+# Vibe would now fall back to its default: no one can say who served it.
+sandbox()
+(home() / ".vibe").mkdir(parents=True, exist_ok=True)
+(home() / ".vibe" / "config.toml").write_text('[[models]]\nname = "qwen"\nprovider = "llamacpp"\nalias = "local"\n')
+write_unified("ses_dropped", usage(5000, 5000), entries=[message("d1", "user", "turn_start")], alias="removed-local")
+with contextlib.redirect_stderr(io.StringIO()):
+  record = vibe("--force")
+  local = collect("local", "--force")
+expect("a Unified Harness session on an alias config.toml dropped is billed to no one",
+       [record["todayTokensByModel"], local["todayTokensByModel"]], [{}, {}], [record, local])
+
 # ------------------------------------------------------- model resolution
 
 sandbox()
@@ -241,9 +267,20 @@ write_meta(session_root() / "session_4", NOW, 80, 0, 0, {
   "active_model": "x", "models": {"x": {"name": "x", "provider": "proxy", "alias": "x"}},
   "providers": [{"name": "proxy", "api_base": "https://mistral.ai.example.com/v1", "backend": "generic"}],
 })
+# The mistral backend sends to its api_base too: one aimed at a server you
+# run is the local collector's, and one at another provider's host is not
+# Mistral's, as Vibe 3.0.1 wrote them against a local mock.
+for n, api_base in ((5, "http://127.0.0.1:18083/v1"), (6, "https://api.deepseek.com/v1")):
+  write_meta(session_root() / f"session_{n}", NOW, 1000 * n, 0, 0, {
+    "active_model": "devstral-mock", "models": [{"name": "devstral-2", "provider": "mistral", "alias": "devstral-mock"}],
+    "providers": [{"name": "mistral", "api_base": api_base, "api_key_env_var": "MISTRAL_API_KEY", "backend": "mistral"}],
+  })
 record = vibe()
 expect("Vibe resolves the session model and its provider as Vibe does",
        {model: usage["inputTokens"] for model, usage in record["modelUsage"].items()}, {"mistral-medium-3.5": 10, "devstral": 20, "codestral": 40}, record)
+local = collect("local", "--force")
+expect("Local counts a mistral-backend session on a server you run",
+       local["todayTokensByModel"], {"devstral-mock": 5000}, local)
 
 # --------------------------------------------------------- untrusted fields
 

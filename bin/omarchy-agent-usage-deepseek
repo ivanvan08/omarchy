@@ -118,13 +118,13 @@ def scan_dsh(stats: Stats) -> bool:
 
 # ------------------------------------------------------------- scan cache
 
-def run_local_scans() -> tuple[dict[str, Any], bool]:
+def run_local_scans(reuse: bool = True) -> tuple[dict[str, Any], bool]:
   stats = Stats()
   complete = add_harness_rows(stats)
   complete = scan_dsh(stats) and complete
   # Claude Code pointed at DeepSeek's Anthropic API, or answered by a
   # DeepSeek model, and a MiniMax Code custom provider at DeepSeek's host.
-  routed_rows, routed_complete = scan_routed(AGENT_ID)
+  routed_rows, routed_complete = scan_routed(AGENT_ID, reuse)
   for row in routed_rows:
     stats.add_row(row, model_name(row.model))
   return stats.snapshot(), complete and routed_complete
@@ -133,7 +133,8 @@ def run_local_scans() -> tuple[dict[str, Any], bool]:
 def cached_local_stats(max_age: float) -> dict[str, Any]:
   # The digest covers every data path the scan reads.
   sources = [opencode_db(), dsh_home(), *pi_session_roots(), *routed_sources()]
-  return cached_scan(AGENT_ID, sources, max_age, run_local_scans, match=routed_match())
+  # A forced scan reads every Codex rollout again too.
+  return cached_scan(AGENT_ID, sources, max_age, lambda: run_local_scans(reuse=max_age > 0), match=routed_match())
 
 
 # -------------------------------------------------------------- credentials

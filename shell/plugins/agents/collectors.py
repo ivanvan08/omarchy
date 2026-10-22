@@ -34,9 +34,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, NamedTuple
@@ -818,21 +820,28 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
   last model switch or reply before it. With neither, nothing says who
   billed it, and it is skipped. A typed prompt is booked on the first reply
   that spent tokens answering it, so tool steps and summaries answer none,
-  and a prompt another provider answered stays with that one. A file with
-  no user messages at all, as only a writer copying pi's format leaves,
-  keeps a prompt per reply.
+  and a prompt another provider answered stays with that one. It counts on
+  its own day, not the reply's, and one whose time can't be trusted doesn't
+  count. A file with no user messages at all, as only a writer copying pi's
+  format leaves, keeps a prompt per reply.
   """
   parsed = [(line_number, entry, _pi_line(entry)) for line_number, entry in lines]
   typed = any(line == ("prompt",) for _, _, line in parsed)
-  asked = False
+  # The day of each typed prompt no reply has answered yet, None for one
+  # whose time can't be trusted.
+  asked: list[str | None] = []
   contexts = _pi_contexts(path, lines) if any(line and line[0] == "summary" for _, _, line in parsed) else []
   for line_number, entry, line in parsed:
     try:
       if line is None or line[0] == "model":
         continue
       kind = line[0]
+      # The entry's own time, else the message's.
+      timestamp = entry.get("timestamp")
+      if timestamp is None:
+        timestamp = obj(entry.get("message")).get("timestamp")
       if kind == "prompt":
-        asked = True
+        asked.append(local_day(timestamp))
         continue
       if kind == "summary":
         before = [context for number_at, context in contexts if number_at < line_number]
@@ -842,22 +851,25 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
         usage = line[1]
       else:
         provider, model, reference, usage = line[1:]
+      counted = _pi_row(entry, timestamp, path, provider, model, obj(usage), int(kind == "reply" and not typed))
+      answered: list[str | None] = []
+      if kind == "reply" and counted is not None:
+        answered, asked = asked, []
       if not accept(provider, model, reference):
-        if kind == "reply":
-          asked = False
         continue
-      # The entry's own time, else the message's.
-      timestamp = entry.get("timestamp")
-      if timestamp is None:
-        timestamp = obj(entry.get("message")).get("timestamp")
-      counted = _pi_row(entry, timestamp, path, provider, model, obj(usage), int(kind == "reply" and (asked or not typed)))
     except Exception:
       # One odd line costs that line, never the scan.
       continue
-    if counted is not None:
-      if kind == "reply":
-        asked = False
-      yield line_number, *counted
+    if counted is None:
+      continue
+    key, row = counted
+    # Prompts typed on the reply's day ride on its row; one typed on another
+    # day is a row of its own there, keyed by the reply that answered it.
+    days = Counter(day for day in answered if day is not None)
+    row = row._replace(prompts=row.prompts + days.pop(row.day, 0))
+    yield line_number, key, row
+    for day, prompts in sorted(days.items()):
+      yield line_number, ("prompt", day, *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, prompts)
 
 
 def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None = None) -> tuple[list[UsageRow], bool]:
@@ -885,9 +897,10 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
     return [], False
 
   # Usage that names no provider of its own, spent on the session's model,
-  # and the prompts the replies answer.
+  # the prompts the replies answer, and every reply, since one another
+  # provider gave still answers the prompt before it.
   summary = r'"type"\s*:\s*"(compaction|branch_summary)"|"role"\s*:\s*"toolResult".*"usage"\s*:\s*\{'
-  context = summary + r'|"role"\s*:\s*"user"'
+  context = summary + r'|"role"\s*:\s*"(user|assistant)"'
 
   # (root, path, line) of every counted line, so the rows come back in one
   # order however rg's threads interleave the files.
@@ -1212,8 +1225,9 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
 # Some harnesses send to whatever base URL they are given and record only the
 # model that answered, or a route's name: Claude Code fronts any endpoint
 # ANTHROPIC_BASE_URL names, and a MiniMax Code custom provider any baseURL.
-# Z.ai, Ollama, MiniMax, DeepSeek, Kimi and OpenRouter each document pointing
-# them at their own APIs, so the host says whose tokens those turns are.
+# Z.ai, Ollama, MiniMax, DeepSeek, Kimi, Alibaba's Model Studio and
+# OpenRouter each document pointing them at their own APIs, so the host says
+# whose tokens those turns are.
 
 # The hosts a harness is pointed at in place of its own service, by the
 # collector that bills them. A subdomain of one is the same service.
@@ -1228,6 +1242,11 @@ PROVIDER_HOSTS = {
   "api.moonshot.cn": "kimi",
   "api.kimi.com": "kimi",
   "api.kimi.ai": "kimi",
+  # Model Studio (DashScope, the Coding and Token Plans) and Qwen's own
+  # sign-in.
+  "aliyuncs.com": "qwen",
+  "alibabacloud.com": "qwen",
+  "qwen.ai": "qwen",
   "openrouter.ai": "openrouter",
 }
 
@@ -1369,8 +1388,10 @@ def claude_code_owner(model: Any, base_url: str = "") -> str | None:
 # and keeps its bare message id and whether a sidechain wrote it. Version 9
 # reads the advisor iterations a reply carries. Version 10 keeps the model
 # that answered each prompt. Version 11 stops counting a built-in local
-# command (/model, /clear, /compact) as a prompt.
-CLAUDE_CODE_INDEX_VERSION = 11
+# command (/model, /clear, /compact) as a prompt. Version 12 keeps each
+# reply's time and the cost-state totals, which count the requests no reply
+# records.
+CLAUDE_CODE_INDEX_VERSION = 12
 
 # How much of each end of what was read the index remembers a hash of, so a
 # file replaced or rewritten with more than it had is not mistaken for an
@@ -1388,6 +1409,18 @@ CLAUDE_CODE_LOCAL_OUTPUT = ("<local-command-stdout>", "<local-command-stderr>")
 # promptSource, a queued one's origin.kind): the system (a task notification)
 # and another agent are not a person asking.
 CLAUDE_CODE_MACHINE_SOURCES = ("system", "task-notification", "peer")
+
+# A line's own time, the last `timestamp` it holds (Claude Code writes it
+# after the message), read without parsing the line.
+CLAUDE_CODE_STAMP = re.compile(rb'"timestamp":\s*"([^"\\]{1,64})"')
+
+# Claude Code 2.1.308 and later write a `cost-state` line when a process
+# saves its running cost: `startTime` names the process's cost lineage,
+# which a resume or `--fork-session` carries on, and `modelUsage` holds what
+# each model has used in it so far, the requests no reply line records
+# (a compaction, the session title, a side query) included. Its model names
+# carry the context window as a suffix the replies don't.
+CLAUDE_CODE_COST_MODEL_SUFFIX = re.compile(r"\[1m\]$", re.IGNORECASE)
 
 
 def claude_code_index_path(projects: Path) -> Path:
@@ -1485,12 +1518,55 @@ def _claude_code_line_day(parsed: dict[str, Any], message: dict[str, Any]) -> tu
   return day is not None, day
 
 
+def _claude_code_moment(value: Any) -> float | None:
+  """When a trusted transcript time was, as epoch seconds, to put a reply
+  before or after a cost-state line (None for no time)."""
+  if value is None or isinstance(value, bool):
+    return None
+  if isinstance(value, str) and re.fullmatch(r"[0-9]{1,20}", value.strip()):
+    value = int(value.strip())
+  if isinstance(value, (int, float)):
+    seconds = math.floor(number(value))
+    return seconds / 1000 if seconds > 10_000_000_000 else float(seconds)
+  try:
+    return datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).timestamp()
+  except (OverflowError, OSError, ValueError):
+    return None
+
+
+def _claude_code_cost_state(parsed: dict[str, Any]) -> tuple[str, dict[str, list[int]]] | None:
+  """The cost lineage and per-model [input, output, cacheRead, cacheWrite]
+  totals of a cost-state line, None for one of another shape."""
+  usage = parsed.get("modelUsage")
+  start = parsed.get("startTime")
+  if not isinstance(usage, dict) or start is None or isinstance(start, (bool, dict, list)) or str(start) == "":
+    return None
+  models: dict[str, list[int]] = {}
+  for name, counts in usage.items():
+    if not isinstance(counts, dict):
+      continue
+    tokens = [
+      usage_tokens(counts, "inputTokens", "input_tokens"),
+      usage_tokens(counts, "outputTokens", "output_tokens"),
+      usage_tokens(counts, "cacheReadInputTokens", "cache_read_input_tokens"),
+      usage_tokens(counts, "cacheCreationInputTokens", "cache_creation_input_tokens"),
+    ]
+    # One model under both names is two counters of the same model.
+    held = models.setdefault(CLAUDE_CODE_COST_MODEL_SUFFIX.sub("", str(name)), [0, 0, 0, 0])
+    for kind, count in enumerate(tokens):
+      held[kind] += count
+  return str(start), models
+
+
 def read_claude_code_transcript(path: Path, entry: dict[str, Any] | None) -> dict[str, Any]:
   """Return the index entry for one transcript, reusing `entry` where the file
   only grew. Records are [key, model, day, input, output, cacheRead,
-  cacheWrite, session, messageId, sidechain]; prompts are [key, day,
+  cacheWrite, session, messageId, sidechain, moment]; prompts are [key, day,
   session, model], the model of the first reply after it (None until one
-  is read). A `day` is None when the line carries no timestamp."""
+  is read); costs are [lineage, session, day, moment, {model: [input,
+  output, cacheRead, cacheWrite]}], each cost-state line's totals at the
+  time of the last line before it. A `day` is None, and a `moment` (epoch
+  seconds) too, when the line carries no timestamp."""
   info = path.stat()
   size = info.st_size
   mtime = info.st_mtime_ns
@@ -1509,11 +1585,15 @@ def read_claude_code_transcript(path: Path, entry: dict[str, Any] | None) -> dic
   ):
     records = list(entry.get("records") or [])
     prompts = [list(prompt) for prompt in entry.get("prompts") or []]
+    costs = list(entry.get("costs") or [])
+    stamp = entry.get("stamp")
     offset = number(entry.get("offset"))
     line_number = number(entry.get("lines"))
   else:
     records = []
     prompts = []
+    costs = []
+    stamp = None
     offset = 0
     line_number = 0
 
@@ -1527,6 +1607,12 @@ def read_claude_code_transcript(path: Path, entry: dict[str, Any] | None) -> dic
   prompted = {prompt[0] for prompt in prompts}
   # Prompts still waiting for their reply, which says who answered them.
   unanswered = [prompt for prompt in prompts if prompt[3] is None]
+  stamped: tuple[bytes, int] | None = None
+
+  def last_stamp() -> Any:
+    found = CLAUDE_CODE_STAMP.match(stamped[0], stamped[1]) if stamped else None
+    return found.group(1).decode("utf-8", errors="replace") if found else stamp
+
   with path.open("rb") as handle:
     handle.seek(offset)
     for raw in handle:
@@ -1536,9 +1622,15 @@ def read_claude_code_transcript(path: Path, entry: dict[str, Any] | None) -> dic
       offset += len(raw)
       line_number += 1
 
+      # A cost-state line carries no time of its own: it was written when
+      # the line before it was, read only when one turns up.
+      at = raw.rfind(b'"timestamp":')
+      if at >= 0:
+        stamped = (raw, at)
+
       # Cheap pre-filter before JSON parsing keeps files with unrelated
       # lines inexpensive.
-      if b'"usage":' not in raw and b'"user"' not in raw and b'"queued_command"' not in raw and b"<local-command-std" not in raw:
+      if b'"usage":' not in raw and b'"user"' not in raw and b'"queued_command"' not in raw and b"<local-command-std" not in raw and b'"cost-state"' not in raw:
         continue
 
       try:
@@ -1550,6 +1642,15 @@ def read_claude_code_transcript(path: Path, entry: dict[str, Any] | None) -> dic
         continue
 
       message = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
+
+      if parsed.get("type") == "cost-state":
+        stamp = last_stamp()
+        stamped = None
+        cost = _claude_code_cost_state(parsed)
+        day = local_day(stamp) if stamp is not None else None
+        if cost is not None and (stamp is None or day is not None):
+          costs.append([cost[0], str(parsed.get("sessionId") or path), day, _claude_code_moment(stamp), cost[1]])
+        continue
 
       # A prompt copied into a resumed or forked transcript keeps its uuid,
       # so the uuid counts it once.
@@ -1594,6 +1695,7 @@ def read_claude_code_transcript(path: Path, entry: dict[str, Any] | None) -> dic
       trusted, day = _claude_code_line_day(parsed, message)
       if not trusted:
         continue
+      moment = _claude_code_moment(parsed["timestamp"] if parsed.get("timestamp") is not None else message.get("timestamp")) if day is not None else None
 
       # An advisor the model consulted is billed apart, under its own model:
       # Claude Code prices each `advisor_message` iteration on its own, and the
@@ -1626,7 +1728,7 @@ def read_claude_code_transcript(path: Path, entry: dict[str, Any] | None) -> dic
         if held is not None and output_tokens < records[held][4]:
           continue
 
-        record = [record_key, model, day, input_tokens, output_tokens, cache_read, cache_write, session_key, record_id, sidechain]
+        record = [record_key, model, day, input_tokens, output_tokens, cache_read, cache_write, session_key, record_id, sidechain, moment]
         if held is None:
           positions[record_key] = len(records)
           records.append(record)
@@ -1642,6 +1744,8 @@ def read_claude_code_transcript(path: Path, entry: dict[str, Any] | None) -> dic
     "lines": line_number,
     "records": records,
     "prompts": prompts,
+    "costs": costs,
+    "stamp": last_stamp(),
   }
 
 
@@ -1670,9 +1774,9 @@ def _claude_code_index_fresh(index: dict[str, Any], files: list[Path]) -> bool:
   return True
 
 
-def _claude_code_read_transcripts(files: list[Path], previous: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-  """Each transcript's index entry, reusing `previous`, and the order they
-  were read in."""
+def _claude_code_read_transcripts(files: list[Path], previous: dict[str, Any]) -> tuple[dict[str, Any], list[str], bool]:
+  """Each transcript's index entry, reusing `previous`, the order they were
+  read in, and whether every one could be read."""
   current: dict[str, Any] = {}
   order: list[str] = []
   unreadable_count = 0
@@ -1694,7 +1798,7 @@ def _claude_code_read_transcripts(files: list[Path], previous: dict[str, Any]) -
   if unreadable_count:
     examples = "; ".join(unreadable_examples)
     print(f"Ignoring {unreadable_count} unreadable Claude project files (examples: {examples})", file=sys.stderr)
-  return current, order
+  return current, order, not unreadable_count
 
 
 _DEFAULT_INDEX = object()
@@ -1707,8 +1811,21 @@ def scan_claude_code(
   base_url: str | None = None,
   reread: bool = False,
 ) -> list[UsageRow]:
-  """The Claude Code usage `owner` counts, as rows: each reply once (with no
-  prompts of its own), each typed prompt once (no tokens), and a tokenless
+  """claude_code_usage()'s rows alone."""
+  return claude_code_usage(owner, projects, index_file, base_url, reread)[0]
+
+
+def claude_code_usage(
+  owner: str,
+  projects: Path | None = None,
+  index_file: Any = _DEFAULT_INDEX,
+  base_url: str | None = None,
+  reread: bool = False,
+) -> tuple[list[UsageRow], bool]:
+  """The Claude Code usage `owner` counts, and whether every transcript was
+  read: one that can't be read keeps what was read of it before, and a scan
+  missing the rest is not one to cache. The rows are each reply once (with
+  no prompts of its own), each typed prompt once (no tokens), and a tokenless
   row for every session in use on a day, for Stats.add_row(). A prompt's row
   names the model that answered it ("" for none yet), so a collector that
   keeps some models alone can keep their prompts alone too.
@@ -1740,18 +1857,18 @@ def scan_claude_code(
   # the numbers must not move because the scan got faster.
   files = list(projects.rglob("*.jsonl")) if projects.is_dir() else []
   if not index_file:
-    current, order = _claude_code_read_transcripts(files, {})
+    current, order, complete = _claude_code_read_transcripts(files, {})
   else:
     lock_file = index_file.with_name(index_file.name + ".lock")
 
-    def build(previous: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-      current, order = _claude_code_read_transcripts(files, previous)
+    def build(previous: dict[str, Any]) -> tuple[dict[str, Any], list[str], bool]:
+      current, order, complete = _claude_code_read_transcripts(files, previous)
       if current != previous:
         try:
           write_json(index_file, {"version": CLAUDE_CODE_INDEX_VERSION, "zone": _claude_code_index_zone(), "files": current}, sort_keys=True)
         except Exception as exc:
           warn(f"could not write the Claude scan index {index_file} ({exc})")
-      return current, order
+      return current, order, complete
 
     loaded = _claude_code_index_stamp(index_file)
     previous = {} if reread else _claude_code_load_index(index_file)
@@ -1767,7 +1884,8 @@ def scan_claude_code(
         if not _claude_code_index_fresh(previous, files):
           with exclusive_lock(lock_file):
             built = build(_claude_code_load_index(index_file))
-    current, order = built or (previous, [str(path) for path in files])
+    # An index fresh for every transcript read them all.
+    current, order, complete = built or (previous, [str(path) for path in files], True)
 
   owners: dict[Any, str | None] = {}
 
@@ -1783,11 +1901,15 @@ def scan_claude_code(
   # in use that day, so a fork that copied a session's replies never takes
   # that session out of the count.
   seen: dict[str, list[Any]] = {}
+  # When a reply was first written, whichever copy of it counts.
+  earliest: dict[str, float] = {}
   active: set[tuple[Any, str, str]] = set()
   for key in order:
     for record in current[key].get("records") or []:
       if ours(record[1]):
         active.add((record[2], record[7], record[1]))
+      if record[10] is not None and record[10] < earliest.get(record[0], math.inf):
+        earliest[record[0]] = record[10]
       held = seen.get(record[0])
       if held is not None and record[4] < held[4]:
         continue
@@ -1800,10 +1922,17 @@ def scan_claude_code(
   parents = {(record[8], record[7], *record[3:7]) for record in seen.values() if record[8] and not record[9]}
   scan_day = today()
   rows: list[UsageRow] = []
-  for _, model, day, input_tokens, output_tokens, cache_read, cache_write, session_key, message_id, sidechain in seen.values():
-    if (sidechain and (message_id, session_key, input_tokens, output_tokens, cache_read, cache_write) in parents) or not ours(model):
+  replies: list[list[Any]] = []
+  for record in seen.values():
+    _, model, day, input_tokens, output_tokens, cache_read, cache_write, session_key, message_id, sidechain, _ = record
+    if sidechain and (message_id, session_key, input_tokens, output_tokens, cache_read, cache_write) in parents:
       continue
-    rows.append(UsageRow(day or scan_day, session_key, owner, model, input_tokens, output_tokens, cache_read, cache_write, prompts=0))
+    replies.append(record)
+    if ours(model):
+      rows.append(UsageRow(day or scan_day, session_key, owner, model, input_tokens, output_tokens, cache_read, cache_write, prompts=0))
+  for day, session_key, model, counts in _claude_code_unrecorded(current, order, replies, earliest):
+    if ours(model):
+      rows.append(UsageRow(day or scan_day, session_key, owner, model, *counts, prompts=0))
 
   # A prompt is what a person typed, not each API request a tool loop makes,
   # so replies carry no prompts and the typed ones are counted on their own,
@@ -1819,7 +1948,76 @@ def scan_claude_code(
       rows.append(UsageRow(day or scan_day, session_key, owner, model or "", 0, 0, 0, 0, prompts=1))
   for day, session_key, model in sorted(active, key=lambda item: (str(item[0]), item[1], item[2])):
     rows.append(UsageRow(day or scan_day, session_key, owner, model, 0, 0, 0, 0, prompts=0))
-  return rows
+  return rows, complete
+
+
+def _claude_code_unrecorded(
+  current: dict[str, Any], order: list[str], replies: list[list[Any]], earliest: dict[str, float]
+) -> list[tuple[str | None, str, str, list[int]]]:
+  """What the cost-state lines say was used beyond the replies, as (day,
+  session, model, [input, output, cacheRead, cacheWrite]): the requests no
+  reply line records, a compaction's, the session title's, a side query's.
+
+  A cost lineage (one `startTime`) holds every session that carried it on,
+  forks included, so each is counted once: its cost-states are taken in
+  time order, each against every reply of its sessions written by then
+  (subagents' included, which run under their parent's session), and only
+  what one says beyond the most already counted is new, on that cost-state's
+  day. A fork's total includes its parent's, and the parent's own replies
+  are among those it is held against, so the parent is never counted twice;
+  two branches that both went on are held against each other's replies too,
+  which can only count too little. Nor can a model name the replies don't
+  use add anything: no more counts, kind by kind, than the whole cost-state
+  says beyond all the replies.
+  """
+  lineages: dict[str, list[list[Any]]] = {}
+  for key in order:
+    for cost in current[key].get("costs") or []:
+      lineages.setdefault(cost[0], []).append(cost)
+  if not lineages:
+    return []
+
+  by_session: dict[str, list[tuple[float, str, list[int]]]] = {}
+  for record in replies:
+    # A reply with no time is held against every cost-state.
+    moment = earliest.get(record[0], -math.inf)
+    by_session.setdefault(record[7], []).append((moment, record[1], record[3:7]))
+
+  unrecorded: dict[tuple[str | None, str, str], list[int]] = {}
+  for events in lineages.values():
+    sessions = {event[1] for event in events}
+    lineage_replies = sorted((reply for session in sessions for reply in by_session.get(session, ())), key=lambda reply: reply[0])
+    # A cost-state with no time is the last, held against every reply.
+    events.sort(key=lambda event: math.inf if event[3] is None else event[3])
+    replied: dict[str, list[int]] = {}
+    replied_total = [0, 0, 0, 0]
+    counted: dict[str, list[int]] = {}
+    position = 0
+    for _, session, day, moment, models in events:
+      until = math.inf if moment is None else moment
+      while position < len(lineage_replies) and lineage_replies[position][0] <= until:
+        _, model, counts = lineage_replies[position]
+        held = replied.setdefault(model, [0, 0, 0, 0])
+        for kind in range(4):
+          held[kind] += counts[kind]
+          replied_total[kind] += counts[kind]
+        position += 1
+      beyond = {model: [max(0, totals[kind] - replied.get(model, (0, 0, 0, 0))[kind]) for kind in range(4)] for model, totals in models.items()}
+      for kind in range(4):
+        room = max(0, sum(totals[kind] for totals in models.values()) - replied_total[kind])
+        claimed = sum(extra[kind] for extra in beyond.values())
+        if claimed > room:
+          for extra in beyond.values():
+            extra[kind] = extra[kind] * room // claimed
+      for model, extra in beyond.items():
+        done = counted.setdefault(model, [0, 0, 0, 0])
+        new = [max(0, extra[kind] - done[kind]) for kind in range(4)]
+        if any(new):
+          counted[model] = [max(done[kind], extra[kind]) for kind in range(4)]
+          held = unrecorded.setdefault((day, session, model), [0, 0, 0, 0])
+          for kind in range(4):
+            held[kind] += new[kind]
+  return [(day, session, model, counts) for (day, session, model), counts in unrecorded.items()]
 
 
 def claude_code_scan_match(claude_dir: Path | None = None) -> dict[str, str]:
@@ -1837,7 +2035,8 @@ def claude_code_scan_match(claude_dir: Path | None = None) -> dict[str, str]:
 # rest (`--oss` on a local daemon, a custom model_providers entry) are read
 # here for the collectors that bill them: the local collector for a
 # self-hosted provider, Ollama Cloud for a cloud-tagged model the local
-# daemon forwarded.
+# daemon forwarded, and a provider's collector for a model_providers entry
+# whose base_url is that provider's host (codex_route_owner).
 
 # The Codex collector counts rollouts on the built-in provider, and ones too
 # old to name a provider at all.
@@ -2087,6 +2286,109 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True) -> tuple[dict[st
     except OSError as exc:
       warn(f"could not write file cache ({exc})")
   return records, complete
+
+def _codex_config_urls(path: Path) -> dict[str, str]:
+  try:
+    with path.open("rb") as handle:
+      config = tomllib.load(handle)
+  except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+    return {}
+  providers = config.get("model_providers")
+  if not isinstance(providers, dict):
+    return {}
+  return {str(name).lower(): str(entry.get("base_url") or "") for name, entry in providers.items() if isinstance(entry, dict)}
+
+
+def codex_config_urls() -> dict[str, str]:
+  """provider id -> base_url, from the Codex CLI's own config: the system
+  layer, the user's config.toml over it, and the profiles
+  (<name>.config.toml) Codex layers over that when one is selected."""
+  home = codex_home()
+  urls: dict[str, str] = {}
+  for path in (Path("/etc/codex/config.toml"), home / "config.toml", *sorted(home.glob("*.config.toml"))):
+    urls.update(_codex_config_urls(path))
+  return urls
+
+
+def codex_providers_path() -> Path:
+  return Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "omarchy" / "agents" / "local-codex-providers.json"
+
+
+def codex_provider_urls() -> dict[str, str]:
+  """provider id -> base_url, for every Codex provider config.toml has named.
+
+  A rollout records only its provider's id, never the URL it reached, so a
+  custom provider that leaves config.toml would take its history with it.
+  Each run remembers the endpoints the config names, per Codex home, and a
+  provider the config no longer has keeps the last one it had. The current
+  config always wins. A provider only ever given on the command line (`-c
+  model_providers...`) or in a project's .codex/config.toml is never seen
+  here: local.json names those for the local collector.
+  """
+  path = codex_providers_path()
+  homes = read_json(path).get("homes")
+  homes = homes if isinstance(homes, dict) else {}
+  key = str(codex_home())
+  known = homes.get(key)
+  known = {str(pid): url for pid, url in known.items() if isinstance(url, str) and url} if isinstance(known, dict) else {}
+  urls = {**known, **codex_config_urls()}
+  remembered = {pid: url for pid, url in urls.items() if url}
+  if remembered != known:
+    try:
+      path.parent.mkdir(parents=True, exist_ok=True)
+      write_json(path, {"homes": {**homes, key: remembered}}, sort_keys=True)
+    except OSError as exc:
+      # Remembering costs nothing when it fails: the current config still
+      # classifies.
+      warn(f"could not remember Codex providers ({exc})")
+  return urls
+
+
+def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | None:
+  """The provider collector that bills a Codex rollout on `provider`, with
+  the model that answered, or None for one no provider's collector counts
+  (the local collector decides which of those it ran itself). The built-in
+  provider is `codex`'s. A model_providers entry whose base_url is a
+  provider's host is that provider's, whatever its id; one on the user's own
+  hardware or a host nothing here can place is no provider's. Past that,
+  `ollama-cloud`, and a cloud-tagged model through the local daemon's
+  `ollama`, are Ollama Cloud's."""
+  name = str(provider or "").strip().lower()
+  if name in ("", CODEX_NATIVE_PROVIDER):
+    return "codex"
+  owner = endpoint_owner(urls.get(name))
+  if owner and owner != "local":
+    return owner
+  if name == "ollama-cloud" or (name == "ollama" and cloud_model(model)):
+    return "ollama"
+  return None
+
+
+def codex_scan_match() -> dict[str, Any]:
+  """For a collector's cached_scan(match=...): which collector each Codex
+  provider's base_url bills, which the config can change without a rollout
+  changing."""
+  return {"codexRoutes": [[pid, endpoint_owner(url)] for pid, url in sorted(codex_provider_urls().items())]}
+
+
+def scan_codex_routed(owner: str, reuse: bool = True) -> tuple[list[UsageRow], bool]:
+  """The Codex rollout totals codex_route_owner() says `owner` bills, as rows
+  (one per rollout, day and model, prompts counted), and whether every
+  rollout was read. Only Ollama Cloud bills a provider no base_url names, so
+  a collector no configured provider points at reads nothing."""
+  urls = codex_provider_urls()
+  if owner != "ollama" and not any(endpoint_owner(url) == owner for url in urls.values()):
+    return [], True
+  records, complete = codex_rollouts(codex_rollout_cache(owner), reuse=reuse)
+  rows = [
+    UsageRow(day, key, owner, model, *totals[:4], prompts=totals[4])
+    for key, record in records.items()
+    for day, models in record["days"].items()
+    for model, totals in models.items()
+    if codex_route_owner(record["provider"], model, urls) == owner
+  ]
+  return rows, complete
+
 
 # ------------------------------------------------------------ Kimchi
 
@@ -2387,24 +2689,26 @@ def mcode_routes(data_dir: Path | None = None) -> dict[str, str]:
   return routes
 
 
-def mcode_route_owner(provider: Any, routes: dict[str, str]) -> str | None:
-  """The collector that bills a MiniMax Code reply on route `provider`. A
-  reply naming none predates third-party routes and ran on MiniMax. A
-  custom provider is its baseURL's (a provider's host, or the user's own
-  hardware); one gone from the config, or behind a gateway nothing here can
-  place, is nobody's here."""
+def mcode_route_owner(provider: Any, routes: dict[str, str], model: Any = None) -> str | None:
+  """The collector that bills a MiniMax Code reply by `model` on route
+  `provider`. A reply naming none predates third-party routes and ran on
+  MiniMax. A custom provider is its baseURL's (a provider's host, or the
+  user's own hardware, where a cloud-tagged model only passed through a
+  local Ollama daemon to Ollama's servers); one gone from the config, or
+  behind a gateway nothing here can place, is nobody's here."""
   if provider in (None, "", *MCODE_PROVIDERS):
     return "minimax"
   name = str(provider)
   if name.startswith("custom_provider:"):
-    return routes.get(name.partition(":")[2]) or None
+    owner = routes.get(name.partition(":")[2]) or None
+    return "ollama" if owner == "local" and cloud_model(model) else owner
   return None
 
 
 def mcode_scan_match() -> dict[str, Any]:
   """For a collector's cached_scan(match=...): which collector each custom
   provider bills, which the config can change without a session changing."""
-  return {"mcodeRoutes": sorted(mcode_routes().items())}
+  return {"mcodeRoutes": [list(item) for item in sorted(mcode_routes().items())]}
 
 
 def _mcode_tokens(usage: dict[str, Any]) -> tuple[int, int, int, int]:
@@ -2431,8 +2735,10 @@ def _mcode_day(message: dict[str, Any], entry: dict[str, Any]) -> str | None:
 def scan_mcode(owner: str) -> tuple[list[UsageRow], bool]:
   """MiniMax Code's replies and typed prompts that `owner` bills, as rows
   (replies with no prompts of their own, prompts with no tokens), and
-  whether every session was read. A prompt goes with the route of the reply
-  that answers it; one left unanswered with the session's last route."""
+  whether every session was read. A prompt goes with the route and model of
+  the reply that answers it, so a collector keeping some models alone keeps
+  their prompts too; one left unanswered with the session's last route and
+  no model."""
   root = mcode_data_dir() / "v2" / "sessions"
   if not root.is_dir():
     return [], True
@@ -2469,9 +2775,10 @@ def scan_mcode(owner: str) -> tuple[list[UsageRow], bool]:
             continue
           if message.get("role") != "assistant":
             continue
-          route = mcode_route_owner(message.get("provider"), routes)
+          model = str(message.get("model") or entry.get("model") or "minimax").strip() or "minimax"
+          route = mcode_route_owner(message.get("provider"), routes, model)
           if route == owner:
-            rows.extend(UsageRow(prompt_day, session, owner, "", 0, 0, 0, 0) for prompt_day in pending)
+            rows.extend(UsageRow(prompt_day, session, owner, model, 0, 0, 0, 0) for prompt_day in pending)
           pending = []
           usage = message.get("usage")
           if route != owner or not isinstance(usage, dict):
@@ -2479,7 +2786,6 @@ def scan_mcode(owner: str) -> tuple[list[UsageRow], bool]:
           input_tokens, output_tokens, cache_read, cache_write = _mcode_tokens(usage)
           if not (input_tokens or output_tokens or cache_read or cache_write):
             continue
-          model = str(message.get("model") or entry.get("model") or "minimax").strip() or "minimax"
           rows.append(UsageRow(day, session, owner, model, input_tokens, output_tokens, cache_read, cache_write, prompts=0))
       if route == owner:
         rows.extend(UsageRow(prompt_day, session, owner, "", 0, 0, 0, 0) for prompt_day in pending)
@@ -2490,28 +2796,32 @@ def scan_mcode(owner: str) -> tuple[list[UsageRow], bool]:
 
 # -------------------------------------------- harnesses routed by base URL
 #
-# Claude Code and MiniMax Code send to whatever endpoint they are given, and
-# record only a model or a route's name, so the collector of every provider
-# they can be pointed at (and `local`, for the user's own hardware) reads
-# both, each keeping what claude_code_owner() and mcode_route_owner() say it
-# bills.
+# Claude Code, MiniMax Code and Codex send to whatever endpoint they are
+# given, and record only a model or a route's name, so the collector of every
+# provider they can be pointed at (and `local`, for the user's own hardware)
+# reads them, each keeping what claude_code_owner(), mcode_route_owner() and
+# codex_route_owner() say it bills. The local collector reads Codex with a
+# rule of its own, since it also counts provider ids no base_url names.
 
 
 def routed_sources() -> list[Path]:
   """The stores scan_routed() reads, for a collector's scan sources."""
-  return [claude_code_dir() / "projects", mcode_data_dir()]
+  return [claude_code_dir() / "projects", mcode_data_dir(), codex_home()]
 
 
 def routed_match() -> dict[str, Any]:
   """What scan_routed() decided owners under, for cached_scan(match=...)."""
-  return {**claude_code_scan_match(), **mcode_scan_match()}
+  return {**claude_code_scan_match(), **mcode_scan_match(), **codex_scan_match()}
 
 
-def scan_routed(owner: str) -> tuple[list[UsageRow], bool]:
-  """Claude Code's and MiniMax Code's usage that `owner` bills, and whether
-  every session was read."""
-  mcode_rows, complete = scan_mcode(owner)
-  return scan_claude_code(owner) + mcode_rows, complete
+def scan_routed(owner: str, reuse: bool = True) -> tuple[list[UsageRow], bool]:
+  """Claude Code's, MiniMax Code's and Codex's usage that `owner` bills, and
+  whether every session was read. `reuse=False` reads every Codex rollout
+  again rather than from its per-file cache."""
+  claude_rows, claude_complete = claude_code_usage(owner)
+  mcode_rows, mcode_complete = scan_mcode(owner)
+  codex_rows, codex_complete = ([], True) if owner == "local" else scan_codex_routed(owner, reuse)
+  return claude_rows + mcode_rows + codex_rows, claude_complete and mcode_complete and codex_complete
 
 
 # ------------------------------------------------------------------ limits

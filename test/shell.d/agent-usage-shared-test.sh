@@ -717,7 +717,7 @@ write_session(harness / "h.jsonl", [reply("demo", 300, "h1"), reply("demo", 100,
 own_rows, own_complete = collectors.scan_pi_sessions(r'"provider"\s*:\s*"demo"', lambda provider, model, entry: True, roots=[harness])
 check("a collector can read a pi-format tree of its own instead", own_complete and sorted(row.input_tokens for row in own_rows) == [100, 300])
 (work / "alias").symlink_to(harness)
-both_rows, _ = collectors.scan_pi_sessions(r'"provider"\s*:\s*"demo"', lambda provider, model, entry: True, roots=[*collectors.pi_session_roots(), harness, work / "alias", work / "missing"])
+both_rows, _ = collectors.scan_pi_sessions(r'"provider"\s*:\s*"demo"', lambda provider, model, entry: provider == "demo", roots=[*collectors.pi_session_roots(), harness, work / "alias", work / "missing"])
 check(
   "roots read beside pi's count a message copied between them once, an alias once, and a missing one as nothing",
   sorted(row.input_tokens + row.output_tokens + row.cache_read + row.cache_write for row in both_rows) == [1, 1, 10, 16, 40, 100, 300, 1000],

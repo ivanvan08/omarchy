@@ -149,6 +149,7 @@ expect("Devin reads the CLI's session database, skipping untrusted fields", {
 
 # In use without any sign-in: the quota has nowhere to come from.
 expect("Devin in use without a sign-in waits for auth", [record["ready"], record["usageStatusText"], record["limits"]], [True, "Waiting for auth", []], record)
+expect("Devin's sessions here are local stats", record["hasLocalStats"], True, record)
 
 # A database it cannot read costs the stats, never the record, and is not
 # cached as the whole story.
@@ -312,4 +313,12 @@ expect("Devin shows no quota windows on a credit plan", devin()["limits"], [])
 # A broken cache file is no quota at all.
 write_json(status_dir() / "user_status.a.bin", {"fetched_at_secs": True, "payload": "%%%"})
 expect("Devin ignores a broken quota cache", devin()["usageStatusText"], "Devin limits unavailable")
+
+# A sign-in with no sessions on this machine shows, with no local stats.
+sandbox()
+signed_in_at(now - 600)
+write_status("a", now, plan="Pro", daily=10, weekly=40, weeklyReset=now + 86400)
+record = devin()
+expect("a Devin sign-in with no sessions here has no local stats",
+       [record["ready"], record["totalSessions"], record["hasLocalStats"]], [True, 0, False], record)
 PY

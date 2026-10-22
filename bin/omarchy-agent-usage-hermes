@@ -94,7 +94,9 @@ def state_paths():
 # cloud one it only forwards. A gateway nothing here can place, or a
 # provider's own API no collector reads Hermes for (Anthropic's, OpenAI's),
 # is nobody's. A row from before Hermes kept the route ran where nothing
-# says, and stays Hermes', as every row was read before.
+# says, and stays Hermes', as every row was read before. A session Hermes
+# keeps routes for that recorded none never reached a provider, since Hermes
+# records the route with the first request it accounts, so no one bills it.
 def route_owner(provider, base_url, model):
   url = str(base_url or "").strip()
   if url:
@@ -134,7 +136,7 @@ def scan(path, owner):
   """One state.db's rows that `owner` bills: a row per session, dated by its
   start, with the tokens of each model it used and the prompts typed on each
   day. A session counts where its route says, else where its first request
-  went."""
+  went, else nowhere when Hermes keeps routes and it made none."""
   conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
   try:
     tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
@@ -153,10 +155,12 @@ def scan(path, owner):
       first_owner.setdefault(session_id, route_owner(provider, url, model))
 
     model_column = "s.model" if "model" in columns(conn, "sessions") else "NULL"
+    session_routes = route_columns(conn, "sessions", "s")
+    unrouted = None if "session_model_usage" in tables and session_routes != "NULL, NULL" else AGENT_ID
     sessions = {}
-    for session_id, started, model, provider, url in conn.execute(f"SELECT s.id, s.started_at, {model_column}, {route_columns(conn, 'sessions', 's')} FROM sessions s"):
+    for session_id, started, model, provider, url in conn.execute(f"SELECT s.id, s.started_at, {model_column}, {session_routes} FROM sessions s"):
       recorded = str(provider or "").strip() or str(url or "").strip()
-      sessions[session_id] = (stamp_day(started), route_owner(provider, url, model) if recorded else first_owner.get(session_id, AGENT_ID))
+      sessions[session_id] = (stamp_day(started), route_owner(provider, url, model) if recorded else first_owner.get(session_id, unrouted))
 
     rows = []
     database = path.resolve()
@@ -192,6 +196,12 @@ def scan(path, owner):
 
 def harness_sources():
   return [path.resolve() for path in state_paths()]
+
+
+# What harness_rows() decided owners under, for cached_scan(match=...):
+# nothing beyond the databases, which record every route themselves.
+def harness_match():
+  return {}
 
 
 def scan_all(paths, owner):

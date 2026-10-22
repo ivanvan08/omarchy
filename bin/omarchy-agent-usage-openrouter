@@ -81,6 +81,7 @@ AGENT_ID = "openrouter"
 AGENT_NAME = "OpenRouter"
 PROVIDER = "openrouter"
 AUTH_HELP = "Set OPENROUTER_API_KEY, or sign in to OpenRouter in opencode, pi or omp. For the 30-day history, add a management key as OPENROUTER_MANAGEMENT_KEY (openrouter.ai/settings/management-keys)."
+MANAGEMENT_AUTH_HELP = "Replace OPENROUTER_MANAGEMENT_KEY (or managementKey in ~/.config/omarchy/agents/openrouter.json) with a working one from openrouter.ai/settings/management-keys."
 API_BASE = "https://openrouter.ai/api/v1"
 
 
@@ -320,14 +321,14 @@ def scan_dsh(stats: Stats) -> bool:
   return complete
 
 
-def scan_local(stats: Stats) -> bool:
+def scan_local(stats: Stats, reuse: bool = True) -> bool:
   # Every source always runs, so one failing still leaves the others' numbers.
   opencode_complete = scan_opencode(stats)
   pi_complete = scan_pi(stats)
   dsh_complete = scan_dsh(stats)
   # Claude Code pointed at OpenRouter's Anthropic-compatible API, and MiniMax
   # Code's custom providers (its OpenRouter preset among them) at OpenRouter.
-  routed_rows, routed_complete = scan_routed(AGENT_ID)
+  routed_rows, routed_complete = scan_routed(AGENT_ID, reuse)
   for row in routed_rows:
     stats.add_row(row, model_name(row.model))
   return opencode_complete and pi_complete and dsh_complete and routed_complete
@@ -351,7 +352,8 @@ def cached_local_stats(max_age: float) -> tuple[dict, bool]:
 
   def scan() -> tuple[dict[str, Any], bool]:
     stats = Stats()
-    complete = scan_local(stats)
+    # A forced scan reads every Codex rollout again too.
+    complete = scan_local(stats, reuse=max_age > 0)
     return stats.snapshot(), complete
 
   return cached_scan(AGENT_ID, scan_sources(), max_age, scan, match=routed_match(), with_complete=True)
@@ -484,19 +486,22 @@ def collect_billing(key: str, manager: str, force: bool) -> dict[str, Any]:
   # refused key: /key says whether the key itself still works. The refusal
   # is kept, so the next refreshes don't ask again. A management key that is
   # refused itself (revoked, or no management key at all) leaves the
-  # inference key to ask.
-  error = None
+  # inference key to ask; when that key has no balance either, the
+  # management key's refusal stands, with its last good balance kept.
+  error = manager_error = None
   if manager:
     parts["credits"], error = probe("/credits", manager, "credits", lambda data: {"balance": credits_balance(data)}, force)
+    manager_error = error
   if key and (not manager or isinstance(error, OpenRouterAuthError)):
+    managed = parts.get("credits"), error
     refusal = LimitsCache(AGENT_ID, key, kind="credits")
     if refusal.data.get("refused") is True and refusal.younger_than(CREDITS_REFUSAL_SECONDS):
-      parts["credits"], error = None, None
+      parts["credits"], error = managed
     else:
       parts["credits"], error = probe("/credits", key, "credits", lambda data: {"balance": credits_balance(data)}, force)
       if isinstance(error, OpenRouterAuthError) and error.code == 403:
         refusal.save([], refused=True)
-        parts["credits"], error = None, None
+        parts["credits"], error = managed
   if error:
     errors["credits"] = error
 
@@ -518,7 +523,12 @@ def collect_billing(key: str, manager: str, force: bool) -> dict[str, Any]:
   result["retryAdvised"] = any(isinstance(error, OpenRouterTransportError) for error in errors.values())
 
   refused = [error for error in errors.values() if isinstance(error, OpenRouterAuthError)]
-  if refused:
+  if refused and refused == [manager_error]:
+    # Only the management key was refused; the inference key, if any, still
+    # works, so the help names the key to replace.
+    result["usageStatusText"] = "Sign-in expired"
+    result["authHelpText"] = "OpenRouter refused the management key. " + MANAGEMENT_AUTH_HELP
+  elif refused:
     result["usageStatusText"] = "Sign-in expired"
     result["authHelpText"] = "OpenRouter refused the API key. " + AUTH_HELP
   elif "key" in errors and meter is None:

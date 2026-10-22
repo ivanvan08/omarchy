@@ -18,6 +18,7 @@ the JSON this prints.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -62,8 +63,11 @@ PROVIDER = "mistral"
 # Vibe's own resolve_default_model_alias does.
 DEFAULT_MODEL_ALIAS = "mistral-medium-3.5"
 
-# Version 1 kept only the sessions Mistral served, so it named no owner.
-INDEX_VERSION = 2
+# Version 1 kept only the sessions Mistral served, so it named no owner,
+# version 2 gave a mistral-backend provider to Mistral wherever its api_base
+# pointed, and version 3 gave a Unified Harness session whose alias config.toml
+# dropped to the default model.
+INDEX_VERSION = 4
 
 # Times read from Vibe's meta.json are untrusted. Anything past these bounds
 # is a corrupt or crafted field, not usage.
@@ -191,17 +195,18 @@ def provider_owner(name, providers, model):
   run, unless the model is a Claude or an Ollama cloud one it only forwards,
   and None for one nothing here can place.
 
-  Vibe marks Mistral's providers with the `mistral` backend; a generic one
-  pointed at a mistral.ai host is the same API. A provider the config doesn't
-  describe is one of Vibe's built-in ones, or no one's.
+  Vibe's `mistral` backend sends to the provider's api_base too, so the
+  api_base decides for it as for a generic one: a mistral.ai host is Mistral's
+  API, and so is a mistral-backend provider that names none. A provider the
+  config doesn't describe is one of Vibe's built-in ones, or no one's.
   """
   api_base = DEFAULT_API_BASES.get(name, "")
   for provider in providers if isinstance(providers, list) else []:
     if not isinstance(provider, dict) or str(provider.get("name") or "") != name:
       continue
-    if str(provider.get("backend") or "").lower() == "mistral":
+    api_base = str(provider.get("api_base") or "").strip()
+    if not api_base and str(provider.get("backend") or "").lower() == "mistral":
       return AGENT_ID
-    api_base = str(provider.get("api_base") or "")
     break
   host = (urlparse(api_base).hostname or "").lower()
   if host == "mistral.ai" or host.endswith(".mistral.ai"):
@@ -384,15 +389,18 @@ def unified_model(alias, config):
   """The model label a Unified Harness session ran on and who bills it, as
   session_model() reads them. The session names only the model's alias, so
   the model and its provider come from config.toml, over Vibe's built-in
-  default."""
+  default. An alias the config no longer names keeps its label and goes
+  to no one, rather than to whichever model Vibe would fall back to."""
   models = config.get("models")
   if isinstance(models, dict):
     models = list(models.values())
-  return session_model({"config": {
-    "active_model": alias,
-    "models": [*(models if isinstance(models, list) else []), DEFAULT_MODEL],
-    "providers": config.get("providers"),
-  }})
+  models = [*(models if isinstance(models, list) else []), DEFAULT_MODEL]
+  if isinstance(alias, str) and alias:
+    known = {str(entry.get("alias") or entry.get("name") or "") for entry in models if isinstance(entry, dict)}
+    if alias not in known:
+      label = model_label(alias)
+      return None if label is None else (label, None)
+  return session_model({"config": {"active_model": alias, "models": models, "providers": config.get("providers")}})
 
 
 def parse_unified(session_dir, config):
@@ -459,6 +467,16 @@ def load_index(path):
 
 def harness_sources():
   return scan_sources()
+
+
+def harness_match():
+  """What harness_rows() decided owners under, for cached_scan(match=...):
+  the models and providers in config.toml, which say where a Unified Harness
+  session went, so a scan made before a route changed never stands in for
+  one after it, in this collector or in local."""
+  config = vibe_config()
+  routes = json.dumps([config.get(key) for key in ("active_model", "models", "providers")], sort_keys=True, default=str)
+  return {"vibeRoutes": hashlib.sha256(routes.encode("utf-8", "surrogatepass")).hexdigest()[:16]}
 
 
 def harness_rows(owner, index_file=False):
@@ -649,7 +667,7 @@ def cached_local_stats(max_age):
   except Exception as exc:
     warn(f"session index unavailable ({exc})")
     index_file = None
-  return cached_scan(AGENT_ID, sources, max_age, lambda: run_scans(index_file))
+  return cached_scan(AGENT_ID, sources, max_age, lambda: run_scans(index_file), match=harness_match())
 
 
 def main():

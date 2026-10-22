@@ -37,9 +37,6 @@ from collectors import (  # noqa: E402
   base_record,
   cached_scan as shared_cached_scan,
   cloud_model,
-  codex_home,
-  codex_rollout_cache,
-  codex_rollouts,
   config_home,
   emit,
   limits_cache_path as shared_limits_cache_path,
@@ -164,33 +161,21 @@ def model_name(raw: str) -> str:
   return (raw or "ollama").split(":", 1)[0]
 
 
-def scan_codex(stats: Stats, model_prefix: str, reuse: bool) -> bool:
-  """Codex rollouts on Ollama Cloud: the `--oss` daemon's cloud-tagged
-  models, or a model_providers entry named `ollama-cloud`, prompts counted
-  as Codex's typed ones. Returns whether every rollout was read."""
-  records, complete = codex_rollouts(codex_rollout_cache(AGENT_ID), reuse=reuse)
-  for key, record in records.items():
-    for day, models in record["days"].items():
-      for model, (input_tokens, output_tokens, cache_read, cache_write, prompts) in models.items():
-        name = model_name(model)
-        if billed_by_ollama_cloud(record["provider"], model) and not (model_prefix and not name.lower().startswith(model_prefix)):
-          stats.add(day, key, name, input_tokens, output_tokens, cache_read, cache_write, prompts=prompts)
-  return complete
-
-
 def scan_sessions(model_prefix: str, reuse: bool = True) -> tuple[dict[str, Any], bool]:
   stats = Stats()
   pi_rows, pi_complete = scan_pi_sessions(r'"provider"\s*:\s*"ollama(-cloud)?"', billed_by_ollama_cloud)
   # The database's prefilter matches both provider ids.
   db_rows, db_complete = scan_opencode(["ollama"], billed_by_ollama_cloud)
-  routed_rows, routed_complete = scan_routed(AGENT_ID)
+  # Codex rollouts come with them, by codex_route_owner(): the `--oss`
+  # daemon's cloud-tagged models, a model_providers entry named
+  # `ollama-cloud`, or one whose base_url is ollama.com.
+  routed_rows, routed_complete = scan_routed(AGENT_ID, reuse)
   for row in pi_rows + db_rows + routed_rows:
     model = model_name(row.model)
     if model_prefix and not model.lower().startswith(model_prefix):
       continue
     stats.add_row(row, model)
-  codex_complete = scan_codex(stats, model_prefix, reuse)
-  return stats.snapshot(), pi_complete and db_complete and codex_complete and routed_complete
+  return stats.snapshot(), pi_complete and db_complete and routed_complete
 
 
 def cached_scan(max_age_seconds: float, model_prefix: str) -> dict[str, Any]:
@@ -200,7 +185,7 @@ def cached_scan(max_age_seconds: float, model_prefix: str) -> dict[str, Any]:
   # the endpoints those were sent to.
   return shared_cached_scan(
     AGENT_ID,
-    [*pi_session_roots(), opencode_db(), codex_home(), *routed_sources()],
+    [*pi_session_roots(), opencode_db(), *routed_sources()],
     max_age_seconds,
     lambda: scan_sessions(model_prefix, reuse=max_age_seconds > 0),
     match={"modelPrefix": model_prefix, **routed_match()},

@@ -67,9 +67,10 @@ expect("Z.ai counts zai and zhipu assistant turns, reasoning already in output",
 
 # a + b land today (25 + 25); f is dated by its message's own time, an old
 # day, so it counts in the totals and never in today's. A prompt books on the
-# first reply after it: a's and f's, b being a further step.
+# first reply after it, a's and f's, b being a further step, and counts on
+# the day it was typed: both today.
 expect("Z.ai dates a turn by message.timestamp, keeping an old one out of today",
-       [record["todayTotalTokens"], record["todayPrompts"], record["totalPrompts"], record["activeDays"]], [50, 1, 2, 2], record)
+       [record["todayTotalTokens"], record["todayPrompts"], record["totalPrompts"], record["activeDays"]], [50, 2, 2, 2], record)
 
 # Claude Code pointed at Z.ai (its settings' env, as Z.ai's guide sets it) is
 # Z.ai's whatever model answered; with no endpoint, only a GLM reply is. A

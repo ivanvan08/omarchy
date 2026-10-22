@@ -197,8 +197,9 @@ expect("Hermes counts a profile linked to its home once",
 # A session counts where Hermes billed it: Nous Portal is Hermes', a server
 # you run the local collector's, and Anthropic's API (or a Claude model on a
 # local proxy), OpenRouter or a gateway nobody's here. A session Hermes kept
-# no route for goes where its first request did, else stays Hermes'. The rows
-# are shaped as Hermes Agent wrote them against a mock of each API.
+# no route for goes where its first request did, and one that never reached a
+# provider is nobody's, its prompt and all. The rows are shaped as Hermes Agent
+# wrote them against a mock of each API.
 sandbox()
 db = home() / ".hermes" / "state.db"
 db.parent.mkdir(parents=True)
@@ -228,16 +229,19 @@ for n, (session, model, provider, url, tokens) in enumerate(ROUTES):
   conn.execute("INSERT INTO session_model_usage (session_id, model, billing_provider, billing_base_url, input_tokens) VALUES (?, ?, ?, ?, ?)", (session, model, provider, url, tokens))
   # The session title is a request of its own, on the session's route.
   conn.execute("INSERT INTO session_model_usage (session_id, model, billing_provider, billing_base_url, task, input_tokens) VALUES (?, ?, ?, ?, 'title_generation', ?)", (session, model, provider, url + "/", tokens))
-# A session whose route Hermes didn't keep, and one that never made a request.
+# A session whose route Hermes didn't keep, and two that failed before any
+# request Hermes accounted, one with the prompt typed into it.
 conn.execute("INSERT INTO sessions VALUES ('unrouted', 'oneshot', 'hermes-mock-model', ?, NULL, NULL, NULL)", (now,))
 conn.execute("INSERT INTO session_model_usage (session_id, model, billing_provider, billing_base_url, input_tokens) VALUES ('unrouted', 'hermes-mock-model', 'custom', 'http://127.0.0.1:18473/v1', 7)")
 conn.execute("INSERT INTO sessions VALUES ('failed', 'oneshot', 'claude-mock-hermes', ?, NULL, NULL, NULL)", (now,))
 conn.execute("INSERT INTO messages VALUES (99, 'failed', 'user', ?)", (now,))
+conn.execute("INSERT INTO messages VALUES (100, 'failed', 'assistant', ?)", (now,))
+conn.execute("INSERT INTO sessions VALUES ('failed-silent', 'oneshot', 'claude-mock-hermes', ?, NULL, NULL, NULL)", (now,))
 conn.commit()
 conn.close()
 record = hermes()
-expect("Hermes counts the sessions Nous Portal billed, and one it kept no route for",
-       [record["todayTokensByModel"], record["todayPrompts"], record["todaySessions"]], [{"Hermes-4-405B": 200}, 2, 2], record)
+expect("Hermes counts the sessions Nous Portal billed, not ones that reached no provider",
+       [record["todayTokensByModel"], record["todayPrompts"], record["todaySessions"]], [{"Hermes-4-405B": 200}, 1, 1], record)
 local = collect("local", "--force")
 expect("Local counts the Hermes sessions a server you run answered",
        [local["todayTokensByModel"], local["todayPrompts"], local["todaySessions"]], [{"hermes-mock-model": 2007}, 1, 2], local)

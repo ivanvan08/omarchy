@@ -261,6 +261,23 @@ pi_auth(None, "ollama-cloud", "$OLLAMA_KEY")
 expect("Ollama passes over pi's $VAR entry to omp's key", load_collector("ollama").api_key(), "omp-key")
 pi_auth(home() / ".omp" / "agent", "ollama-cloud", "!pass show ollama")
 expect("Ollama never sends a pi $VAR or !command entry as a key", load_collector("ollama").api_key(), "")
+# A MiniMax Code custom provider on the local daemon that answered with a
+# cloud-tagged model ran on Ollama's servers, so it is Ollama's, prompt and
+# all, and no local work.
+sandbox()
+mcode_routed_session("box", "custom_provider:box", "gpt-oss:120b-cloud", 500, base_url="http://127.0.0.1:11434/v1")
+record = ollama()
+expect("Ollama counts a MiniMax Code cloud-tagged model sent through the local daemon",
+       [record["todayTokensByModel"], record["todayPrompts"]], [{"gpt-oss": 500}, 1], record)
+
+# A MiniMax Code prompt takes the model of the reply that answered it, so the
+# model prefix keeps it with its reply.
+sandbox()
+mcode_routed_session("oc", "custom_provider:oc", "claude-sonnet-4-5", 40, base_url="https://ollama.com/v1")
+prefix("claude")
+record = ollama()
+expect("Ollama's model prefix keeps a MiniMax Code prompt with the reply that answered it",
+       [record["todayTokensByModel"], record["todayPrompts"]], [{"claude-sonnet-4-5": 40}, 1], record)
 
 # omp keeps the key it signed in with in its agent.db, never in an auth.json;
 # a key it disabled is passed over, and PI_CODING_AGENT_DIR moves the

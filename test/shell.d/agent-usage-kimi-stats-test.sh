@@ -198,6 +198,51 @@ local = collect("local", "--force")
 expect("Local counts the Kimi Code requests a server you run answered, and their prompts",
        [local["todayTokensByModel"], local["todayPrompts"]], [{"mock/kimi-k2": 2286}, 1], local)
 
+# A prompt no request answered goes where its requests were sent, answered or
+# not, else where its agent was bound: a server you run that refused every
+# attempt is local's, and Kimi's own plan Kimi's. Shaped as Kimi Code 2.3.0
+# wrote `kimi -m dead/kimi-dead -p` against a dead port, retries and all.
+sandbox()
+(home() / ".kimi-code").mkdir()
+(home() / ".kimi-code" / "config.toml").write_text("""[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+model = "kimi-for-coding"
+
+[providers.dead]
+type = "kimi"
+base_url = "http://127.0.0.1:18499/v1"
+api_key = "sk-test-dummy-dead"
+
+[models."dead/kimi-dead"]
+provider = "dead"
+model = "kimi-dead"
+max_context_size = 131072
+""")
+
+
+def failed_turn(alias, prompt_id, at, attempts=2):
+  lines = [{"type": "profile.bind", "agentId": "main", "modelAlias": alias, "profileName": "agent", "thinkingEffort": "off", "systemPrompt": "You are Kimi Code CLI"}, prompt("hi", prompt_id, at)]
+  for step in range(1, attempts + 1):
+    lines += [
+      {"type": "llm.request", "agentId": "main", "kind": "loop", "provider": "openai", "model": alias.split("/")[-1], "modelAlias": alias, "turnStep": f"0.{step}", "time": at + step},
+      {"type": "context.append_loop_event", "agentId": "main", "event": {"type": "step.end", "turnId": "0", "step": step, "finishReason": "error"}, "time": at + step},
+    ]
+  return lines + [{"type": "turn.ended", "agentId": "main", "turnId": 0, "reason": "failed", "error": {"code": "provider.connection_error", "message": "Connection error.", "name": "APIConnectionError", "retryable": True}, "time": at + 9}]
+
+
+wire("session_dead", failed_turn("dead/kimi-dead", "msg_01M5J2C56CQXYMM9KX3ABF4D0H", NOW_MS))
+wire("session_plan", failed_turn("kimi-code/kimi-for-coding", "msg_p", NOW_MS))
+# Bound to the dead server, and stopped before any request.
+wire("session_bound", failed_turn("dead/kimi-dead", "msg_b", NOW_MS, attempts=0))
+records = {cid: collect(cid, "--force") for cid in ("kimi", "local")}
+expect("a Kimi Code prompt no request answered counts where its route goes",
+       {cid: [record["todayPrompts"], record["todaySessions"], record["todayTotalTokens"]] for cid, record in records.items()},
+       {"kimi": [1, 1, 0], "local": [2, 2, 0]}, records)
+
 # A fork copies its source's wire, then marks it forked; the copies count
 # once, under the source's session, while what the fork did after counts too.
 # A fork with nothing of its own is no session of its own.
@@ -288,6 +333,27 @@ record = kimi()
 expect("Kimi counts pi and opencode on the Kimi Code plan ids and Moonshot's pay-as-you-go API",
        [record["todayTokensByModel"], record["ready"], record["usageStatusText"]],
        [{"k3": 300, "kimi-k2.6": 1998, "kimi-for-coding": 200, "kimi-for-coding-highspeed": 20}, True, "Waiting for auth"], record)
+
+# A route change reaches the cached scan at once, even on the panel's
+# --limits-only refresh that otherwise reuses a scan for minutes: the request
+# config.toml didn't name was Kimi's, and once it names a server you run, it
+# is not. Shaped as Kimi Code 2.3.0 wrote a tool loop on that alias.
+sandbox()
+(home() / ".kimi-code").mkdir()
+(home() / ".kimi-code" / "config.toml").write_text('default_model = "x"\n')
+wire("session_tool", [prompt("TOOLLOOP read note.txt", "msg_t1", NOW_MS), usage(NOW_MS + 10, 24702, 120, 0, model="mock2/kimi-tool")])
+before = kimi("--limits-only")
+(home() / ".kimi-code" / "config.toml").write_text("""[providers.mock2]
+type = "kimi"
+base_url = "http://127.0.0.1:18491/v1"
+
+[models."mock2/kimi-tool"]
+provider = "mock2"
+model = "kimi-tool"
+""")
+after = kimi("--limits-only")
+expect("a Kimi Code route change reaches Kimi's cached scan at once",
+       [before["todayTokensByModel"], after["todayTokensByModel"], after["todayPrompts"]], [{"mock2/kimi-tool": 24822}, {}, 0], after)
 
 # ---------------------------------------------------------------- contract
 

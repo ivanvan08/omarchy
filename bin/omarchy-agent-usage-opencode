@@ -411,7 +411,8 @@ def main():
     AGENT_ID,
     AGENT_NAME,
     ready=number(stats.get("totalPrompts")) > 0 or bool(limits["limits"]) or limits["signedIn"],
-    hasLocalStats=True,
+    # A sign-in with no sessions here has no local stats to show.
+    hasLocalStats=number(stats.get("totalSessions")) > 0 or number(stats.get("totalPrompts")) > 0 or bool(stats.get("modelUsage")),
     tierLabel=limits["tierLabel"],
     usageStatusText=limits["usageStatusText"],
     authHelpText=limits["authHelpText"],

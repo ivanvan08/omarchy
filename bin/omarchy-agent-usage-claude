@@ -53,7 +53,7 @@ from collectors import (  # noqa: E402
   read_json,
   recent_dates,
   registered_accounts,
-  scan_claude_code,
+  claude_code_usage,
   scan_opencode,
   scan_pi_sessions,
   today as today_string,
@@ -83,17 +83,25 @@ def expand_path(value: str) -> Path:
 
 # Claude Code's transcripts are read by the shared reader, through the index
 # every collector that reads them shares. Claude Code fronts whatever
-# ANTHROPIC_BASE_URL names, and Z.ai, Ollama, MiniMax, DeepSeek, Kimi and
-# OpenRouter each document pointing it at their own Anthropic-compatible API;
+# ANTHROPIC_BASE_URL names, and Z.ai, Ollama, MiniMax, DeepSeek, Kimi,
+# OpenRouter and Alibaba's Model Studio each document pointing it at their
+# own Anthropic-compatible API;
 # only what Anthropic served is Claude's, and claude_code_owner() hands the
 # rest to the collector that bills it.
 
 
 def scan_projects(projects_path: Path, index_file: Path | None = None, base_url: str = "", reread: bool = False) -> Stats:
+  return scan_projects_read(projects_path, index_file, base_url, reread)[0]
+
+
+def scan_projects_read(projects_path: Path, index_file: Path | None = None, base_url: str = "", reread: bool = False) -> tuple[Stats, bool]:
+  """The transcripts' stats, and whether every transcript was read: a scan
+  that missed one isn't cached."""
   stats = Stats()
-  for row in scan_claude_code(AGENT_ID, projects_path, index_file, base_url, reread):
+  rows, read_all = claude_code_usage(AGENT_ID, projects_path, index_file, base_url, reread)
+  for row in rows:
     stats.add_row(row, row.model)
-  return stats
+  return stats, read_all
 
 
 def anthropic_served(model: Any, base_url: str) -> bool:
@@ -104,7 +112,50 @@ def anthropic_served(model: Any, base_url: str) -> bool:
 #
 # A machine without transcripts on disk can still know its history: Claude
 # Code keeps aggregate counters in stats-cache.json and per-prompt history in
-# history.jsonl. Only consulted when the project scan comes back empty.
+# history.jsonl. Only consulted when projects/ holds no transcript at all: a
+# scan that gave every reply to another collector has counted each prompt
+# already, under whoever answered it. Neither file says who answered, so
+# while ANTHROPIC_BASE_URL names another provider's host their prompts and
+# sessions are that provider's, which reads no fallback, and count nowhere.
+
+# Claude Code's built-in commands that run on their own and ask the model
+# nothing (Claude Code 2.1.308's `local` and `local-jsx` commands and their
+# aliases), which history.jsonl keeps as typed. The transcript reader knows
+# one by the local output answering it; history.jsonl keeps no output, so
+# only the name tells. A custom command, a skill, and a built-in that sends a
+# prompt (/init, /statusline) are prompts.
+CLAUDE_CODE_LOCAL_COMMANDS = frozenset((
+  "add-dir", "advisor", "agents", "allowed-tools", "android", "app", "artifacts", "autocompact", "autofix-pr",
+  "auto-mode-setup", "background", "bashes", "bg", "branch", "break-reminder", "breaks", "brief", "btw", "bug", "cd",
+  "checkpoint", "clear", "cloud-plugins", "color", "compact", "config", "context", "copy", "cost", "daemon",
+  "design-consent", "design-login", "design-revoke", "desktop", "diff", "downtime", "effort", "exit", "export",
+  "extra-usage", "fast", "feedback", "focus", "fork", "goal", "heapdump", "help", "hooks", "ide", "import", "install",
+  "install-github-app", "install-slack-app", "ios", "list-agents", "login", "logout", "loops", "marketplace", "mcp",
+  "memory", "memory-pause", "mobile", "model", "name", "new", "output-style", "passes", "pause-memory", "peers",
+  "permissions", "plan", "plugin", "plugins", "powerup", "privacy-settings", "pro-trial-expired", "quit", "radio",
+  "rate-limit-options", "rc", "recap", "reload-plugins", "reload-skills", "remote", "remote-control", "remote-env",
+  "rename", "reset", "restart", "resume", "rewind", "scroll-speed", "session", "settings", "setup-bedrock",
+  "setup-vertex", "skill-doctor", "skills", "stats", "status", "stickers", "stop", "subtask", "tasks", "teleport",
+  "terminal-setup", "theme", "toggle-memory", "tp", "tui", "ultraplan", "ultrareview", "undo", "update", "upgrade",
+  "usage", "usage-credits", "version", "voice", "web-setup", "wellbeing", "workflow-launch-exec", "workflows",
+))
+
+
+def history_prompt(display: Any) -> bool:
+  """Whether a history.jsonl entry's text was a prompt: anything but a
+  built-in local command, with or without arguments."""
+  text = str(display or "").strip()
+  if not text.startswith("/"):
+    return True
+  name = text[1:].split(None, 1)[0].lower() if len(text) > 1 else ""
+  return name not in CLAUDE_CODE_LOCAL_COMMANDS
+
+
+def has_transcripts(projects: Path) -> bool:
+  try:
+    return next(projects.rglob("*.jsonl"), None) is not None
+  except OSError:
+    return False
 
 
 def stats_cache_fallback(claude_dir: Path, base_url: str = "") -> dict[str, Any] | None:
@@ -144,9 +195,12 @@ def stats_cache_fallback(claude_dir: Path, base_url: str = "") -> dict[str, Any]
     if isinstance(bucket, dict) and anthropic_served(model, base_url)
   }
 
-  daily_activity = entries("dailyActivity")
+  # Prompts and sessions name no model, so they are Claude's unless Claude
+  # Code is sent to another provider's host.
+  prompts_here = anthropic_served(None, base_url)
+  daily_activity = entries("dailyActivity") if prompts_here else []
   active_dates = sorted({str(day.get("date")) for day in daily_activity if number(day.get("messageCount")) > 0 and day.get("date")})
-  today_prompts, today_sessions = today_prompts_from_history(claude_dir)
+  today_prompts, today_sessions = today_prompts_from_history(claude_dir, base_url)
 
   return {
     "todayPrompts": today_prompts,
@@ -155,14 +209,16 @@ def stats_cache_fallback(claude_dir: Path, base_url: str = "") -> dict[str, Any]
     "todayTokensByModel": today_tokens,
     "recentDays": recent_days,
     "modelUsage": model_usage,
-    "totalPrompts": number(data.get("totalMessages")),
-    "totalSessions": number(data.get("totalSessions")),
+    "totalPrompts": number(data.get("totalMessages")) if prompts_here else 0,
+    "totalSessions": number(data.get("totalSessions")) if prompts_here else 0,
     "activeDays": len(active_dates),
     "activeDates": active_dates,
   }
 
 
-def today_prompts_from_history(claude_dir: Path) -> tuple[int, int]:
+def today_prompts_from_history(claude_dir: Path, base_url: str = "") -> tuple[int, int]:
+  if not anthropic_served(None, base_url):
+    return 0, 0
   prompts = 0
   sessions: set[str] = set()
   start_of_day = dt.datetime.combine(dt.datetime.now().date(), dt.time.min).timestamp() * 1000
@@ -184,6 +240,8 @@ def today_prompts_from_history(claude_dir: Path) -> tuple[int, int]:
       continue
     if number(entry.get("timestamp")) < start_of_day:
       break
+    if not history_prompt(entry.get("display")):
+      continue
     prompts += 1
     if entry.get("sessionId"):
       sessions.add(str(entry.get("sessionId")))
@@ -225,13 +283,14 @@ def scan_local(claude_dir: Path, index_file: Path | None, reread: bool = False) 
   (safe to cache). Transcripts come first; only a machine without any falls
   back on Claude Code's own aggregate counters."""
   base_url = claude_code_base_url(claude_dir)
-  stats = scan_projects(claude_dir / "projects", index_file, base_url, reread)
+  projects = claude_dir / "projects"
+  stats, transcripts_complete = scan_projects_read(projects, index_file, base_url, reread)
   pi_rows, pi_complete = scan_pi_sessions(PI_PATTERN, billed_here)
   # The closing quote makes the database's prefilter match the whole id.
   db_rows, db_complete = scan_opencode(['anthropic"'], billed_here)
-  complete = pi_complete and db_complete
+  complete = transcripts_complete and pi_complete and db_complete
 
-  if stats.total_prompts > 0 or stats.model_usage:
+  if stats.total_prompts > 0 or stats.model_usage or has_transcripts(projects):
     add_shared_rows(stats, pi_rows, db_rows)
     return stats.snapshot(), complete
 
@@ -240,7 +299,7 @@ def scan_local(claude_dir: Path, index_file: Path | None, reread: bool = False) 
     local = stats.snapshot()
     # No transcripts and no aggregate cache, but history.jsonl alone can
     # still put numbers on today.
-    today_prompts, today_sessions = today_prompts_from_history(claude_dir)
+    today_prompts, today_sessions = today_prompts_from_history(claude_dir, base_url)
     if today_prompts or today_sessions:
       local.update(todayPrompts=today_prompts, todaySessions=today_sessions)
   extra = Stats()

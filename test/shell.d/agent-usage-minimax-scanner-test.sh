@@ -165,6 +165,22 @@ record = minimax()
 expect("MiniMax counts every Claude Code reply while Claude Code is pointed at MiniMax",
        [record["todayTokensByModel"], record["todayPrompts"]], [{"MiniMax-M2": 300, "claude-sonnet-4-5": 40}, 2], record)
 
+# Nor is a scan that couldn't read one of Claude Code's transcripts kept for
+# the next run.
+if os.geteuid() != 0:
+  sandbox()
+  claude_code_session("mm", [("MiniMax-M2", 300)])
+  locked = claude_code_session("late", [("MiniMax-M2", 40)])
+  locked.chmod(0)
+  try:
+    minimax()
+  finally:
+    locked.chmod(0o644)
+  record = minimax("--limits-only")
+  expect("MiniMax does not cache a scan that missed a Claude Code transcript", record["todayTokensByModel"], {"MiniMax-M2": 340}, record)
+else:
+  print("ok - MiniMax does not cache a scan that missed a Claude Code transcript # SKIP root reads anything")
+
 # A MiniMax Code custom provider is billed by whoever runs its baseURL in
 # config.yaml: one at MiniMax's own host is MiniMax's, one at OpenRouter's
 # isn't, and neither is one gone from the config.

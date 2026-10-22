@@ -125,6 +125,8 @@ record, http = opencode(None, 403)
 check("OpenCode collector stays silent for a key without a Go plan",
       record["limits"] == [] and record["usageStatusText"] == "" and record["authHelpText"] == "" and record["tierLabel"] == ""
       and record["limitsStale"] is False and http.count == 1, record)
+check("an OpenCode key with no sessions here has no local stats",
+      record["ready"] is True and record["totalSessions"] == 0 and record["hasLocalStats"] is False, record)
 record, http = opencode(None, 403, "--limits-only")
 check("OpenCode collector doesn't ask again about a key without a Go plan",
       record["usageStatusText"] == "" and record["limits"] == [] and http.count == 0, record)

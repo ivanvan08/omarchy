@@ -262,7 +262,15 @@ expect("a weekly included allowance reads Weekly and resets with the week", read
   for period in ("INCLUDED_USAGE_PERIOD_WEEKLY", "WEEKLY", "2")
 }, read)
 
+# A weekly plan whose GetPlanInfo fails can't say its week's reset, so the
+# known weekly limits are kept, stale, rather than read as Monthly.
+record = cursor(routes=dict(weekly_routes, **{RPC + "GetPlanInfo": 500}))
+expect("a weekly plan that can't be checked keeps its weekly limits, stale",
+       [[[limit["title"], limit["resetsAt"]] for limit in record["limits"]], record["limitsStale"], record["tierLabel"]],
+       [read["2"], True, "Ultra"], record)
+
 # GetPlanInfo failing leaves the plan the account last had.
+cursor(routes=routes)
 record = cursor(routes=dict(routes, **{RPC + "GetPlanInfo": 500}))
 expect("the plan is kept when GetPlanInfo fails", [record["tierLabel"], record["limitsStale"]], ["Ultra", False], record)
 

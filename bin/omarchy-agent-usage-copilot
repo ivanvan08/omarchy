@@ -911,7 +911,8 @@ def main() -> int:
     AGENT_ID,
     AGENT_NAME,
     ready=ready,
-    hasLocalStats=True,
+    # A store of custom-provider requests alone leaves nothing of Copilot's.
+    hasLocalStats=number(stats.get("totalSessions")) > 0 or bool(stats.get("modelUsage")),
     hasPromptStats=stats.get("hasPromptStats") is not False,
     tierLabel=allowance["tierLabel"],
     usageStatusText=allowance["usageStatusText"],
