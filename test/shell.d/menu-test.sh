@@ -243,15 +243,15 @@ assertEqual(
   'menu lists Reset Computer last under Setup'
 )
 const expectedAgents = {
-  agy: { icon: '󰫢', label: 'Antigravity' },
+  agy: { icon: '\ue91b', iconFont: 'omarchy', label: 'Antigravity' },
   pi: { icon: '\ue901', iconFont: 'omarchy', label: 'Pi' },
   omp: { icon: '\ue903', iconFont: 'omarchy', label: 'omp' },
   opencode: { icon: '\ue902', iconFont: 'omarchy', label: 'OpenCode' },
   ori: { icon: '\ue909', iconFont: 'omarchy', label: 'Ori' },
-  claude: { icon: '󰛄', label: 'Claude' },
+  claude: { icon: '\ue90e', iconFont: 'omarchy', label: 'Claude' },
   codex: { icon: '\ue905', iconFont: 'omarchy', label: 'Codex' },
   grok: { icon: '\ue904', iconFont: 'omarchy', label: 'Grok' },
-  kimi: { icon: '\u{f06a9}', label: 'Kimi' },
+  kimi: { icon: '\ue91c', iconFont: 'omarchy', label: 'Kimi' },
   qwen: { icon: '\ue90f', iconFont: 'omarchy', label: 'Qwen Code' },
   dsh: { icon: '\ue910', iconFont: 'omarchy', label: 'DeepSeek Harness' },
   mcode: { icon: '\ue911', iconFont: 'omarchy', label: 'MiniMax Code' },
@@ -264,10 +264,9 @@ const expectedAgents = {
   hermes: { icon: '\ue90a', iconFont: 'omarchy', label: 'Hermes' },
   openclaw: { icon: '\ue90c', iconFont: 'omarchy', label: 'OpenClaw' },
   copilot: { icon: '', label: 'Copilot' },
-  crush: { icon: '󰋑', label: 'Crush' },
-  muse: { icon: '󰛤', label: 'Muse Code' },
+  crush: { icon: '\ue91d', iconFont: 'omarchy', label: 'Crush' },
+  muse: { icon: '\ue91e', iconFont: 'omarchy', label: 'Muse Code' },
   'cursor-agent': { icon: '\ue90d', iconFont: 'omarchy', label: 'Cursor CLI' },
-
 }
 assert(
   Object.entries(expectedAgents).every(([agent, expected]) => {
@@ -938,5 +937,5 @@ assert(
 JS
 
 font_charset=$(fc-query --format='%{charset}' "$ROOT/default/fonts/omarchy/omarchy.ttf")
-[[ $font_charset == *"e900-e91a"* ]] || fail "Omarchy icon font includes every custom menu glyph"
+[[ $font_charset == *"e900-e91e"* ]] || fail "Omarchy icon font includes every custom menu glyph"
 pass "Omarchy icon font includes the official agent marks"

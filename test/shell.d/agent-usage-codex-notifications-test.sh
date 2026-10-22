@@ -36,41 +36,42 @@ def event(total, last=None, offset=0):
             "rate_limits": {"primary": {"used_percent": offset}}}}
 
 
-def counts(name, rollouts, expected_tokens, expected_prompts):
+def counts(name, rollouts, expected_tokens):
   sandbox()
   for relative_path, events in rollouts.items():
     write_pi_session(home() / ".codex" / relative_path, events)
   record = collect("codex", "--force")
   counted = sum(sum(bucket.values()) for bucket in record["modelUsage"].values())
+  # Requests are no prompts: none here was typed.
   expect(name, [counted, record["totalPrompts"], sum(day["messageCount"] for day in record["recentDays"])],
-         [expected_tokens, expected_prompts, expected_tokens], record)
+         [expected_tokens, 0, expected_tokens], record)
 
 
 counts("repeated snapshots ignore timestamp and quota changes", {
   "sessions/main.jsonl": [event(tokens()), event(tokens(), offset=1), event(tokens(), offset=2)]
-}, 110, 1)
+}, 110)
 
 counts("equal request sizes count when cumulative usage advances", {
   "sessions/main.jsonl": [event(tokens()), event(tokens(200, 20), offset=1)]
-}, 220, 2)
+}, 220)
 
 counts("deduplication stays within each rollout", {
   "sessions/first.jsonl": [event(tokens())],
   "archived_sessions/second.jsonl": [event(tokens()), event(tokens(), offset=1)]
-}, 220, 2)
+}, 220)
 
 counts("requests without cumulative counters remain countable", {
   "sessions/main.jsonl": [event(None), event(None, offset=1), event({}), event({}, offset=1)]
-}, 440, 4)
+}, 440)
 
 counts("counter resets do not discard new requests", {
   "sessions/main.jsonl": [event(tokens()), event(tokens(200, 20)), event(tokens())]
-}, 330, 3)
+}, 330)
 
 counts("quota-only events and model context do not reset deduplication", {
   "sessions/main.jsonl": [event(tokens()),
     {"type": "event_msg", "payload": {"type": "token_count", "info": None}},
     {"type": "turn_context", "payload": {"model": "another-model"}},
     event(tokens(), offset=1)]
-}, 110, 1)
+}, 110)
 PY

@@ -160,6 +160,18 @@ expect("Synthetic fills a limited rolling window and skips an unreadable one",
        [entry["percent"] for entry in parse_quotas({"rollingFiveHourLimit": {"remaining": 900, "max": 1000, "limited": True}, "weeklyTokenLimit": {"percentRemaining": True}})],
        [1.0])
 
+# SYNTHETIC_API_BASE_URL moves the endpoint, never the key onto plain HTTP
+# to another machine, nor into a URL that isn't one.
+sandbox()
+os.environ["SYNTHETIC_API_KEY"] = "secret"
+for url in ("http://evil.example", "not a url"):
+  os.environ["SYNTHETIC_API_BASE_URL"] = url
+  with FakeHttp({"/v2/quotas": MODERN}) as http:
+    record = collect("synthetic", "--force")
+  expect(f"Synthetic sends its key to no untrusted endpoint ({url})",
+         [http.count, record["usageStatusText"], "HTTPS" in record["authHelpText"]], [0, "Synthetic limits unavailable", True], record)
+del os.environ["SYNTHETIC_API_KEY"], os.environ["SYNTHETIC_API_BASE_URL"]
+
 # ------------------------------------------------------------ local stats
 
 # Synthetic serves Hugging Face models as hf:org/model; the model is the last

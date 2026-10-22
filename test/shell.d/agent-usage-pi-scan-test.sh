@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# Every collector reads the whole pi/omp history through scan_pi_sessions,
+# each for its own providers, so what one scan parses is paid once per
+# collector on every refresh. A file holding none of a collector's lines
+# must cost it nothing beyond rg's search: its prompts, tool results and
+# compactions are never parsed, and the file is never read again for the
+# model a summary ran on. A count, the same on every machine, rather than a
+# time.
+
+set -euo pipefail
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
+
+require_command python3
+require_command rg
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.environ["OMARCHY_PATH"], "shell", "plugins", "agents"))
+import collectors  # noqa: E402
+
+work = Path(os.environ["WORK"])
+home = work / "home"
+home.mkdir()
+os.environ["HOME"] = str(home)
+for name in ("PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"):
+  os.environ.pop(name, None)
+
+
+def check(description, condition, detail=""):
+  if condition:
+    print("ok - " + description)
+    return
+  print("not ok - " + description, file=sys.stderr)
+  if detail:
+    print(detail, file=sys.stderr)
+  sys.exit(1)
+
+
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+runtime = {"version": "18.12.6"}
+
+
+def usage(tokens):
+  return {"input": tokens, "output": 10, "cacheRead": 0, "cacheWrite": 0, "totalTokens": tokens + 10, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}
+
+
+def pi_session(provider, model, n, tokens):
+  """A tool-loop session as pi 1.4.0 writes one, with a pasted image and a
+  compaction, on one provider."""
+  lines = [
+    {"type": "session", "version": 3, "id": f"s{n}", "timestamp": stamp, "cwd": "/proj"},
+    {"type": "model_change", "id": f"mc{n}", "parentId": None, "timestamp": stamp, "provider": provider, "modelId": model},
+    {"type": "message", "id": f"u{n}", "timestamp": stamp, "message": {"role": "user", "content": [{"type": "text", "text": "read it"}, {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo" * 2000}], "timestamp": 1}},
+    {"type": "message", "id": f"a{n}", "timestamp": stamp, "message": {"role": "assistant", "content": [{"type": "toolCall", "id": f"c{n}", "name": "read", "arguments": {"path": "/x"}}],
+                                                                     "api": "openai-completions", "provider": provider, "model": model, "usage": usage(tokens), "stopReason": "toolUse", "timestamp": 2}},
+    {"type": "message", "id": f"r{n}", "timestamp": stamp, "message": {"role": "toolResult", "toolCallId": f"c{n}", "toolName": "read", "content": [{"type": "text", "text": "x" * 4000}], "isError": False, "timestamp": 3}},
+    {"type": "message", "id": f"b{n}", "timestamp": stamp, "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}],
+                                                                     "api": "openai-completions", "provider": provider, "model": model, "usage": usage(tokens + 1), "stopReason": "stop", "timestamp": 4}},
+    {"type": "compaction", "id": f"cp{n}", "parentId": f"b{n}", "timestamp": stamp, "summary": "s", "firstKeptEntryId": f"u{n}", "tokensBefore": 40000, "usage": usage(tokens + 2)},
+  ]
+  return lines
+
+
+def write(path, lines):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+sessions = home / ".pi" / "agent" / "sessions" / "--proj--"
+write(sessions / "mine.jsonl", pi_session("demo", "demo-model", 0, 1000))
+for n in range(1, 41):
+  write(sessions / f"other-{n}.jsonl", pi_session(f"other{n % 4}", "other-model", n, 50000))
+# As omp 18.12.6 writes one: the switch names provider/model, no field
+# `pattern` sees, and the only usage is a compaction on that model.
+write(home / ".omp" / "agent" / "sessions" / "-" / "omp-compacted.jsonl", [
+  {"type": "session", "version": 3, "id": "o1", "timestamp": stamp, "cwd": "/proj"},
+  {"type": "model_change", "id": "omc", "parentId": None, "timestamp": stamp, "runtime": runtime, "model": "demo/omp-model", "resolvedModelIsFallback": False},
+  {"type": "message", "id": "ou", "timestamp": stamp, "runtime": runtime, "message": {"role": "user", "content": [{"type": "text", "text": "compact"}], "attribution": "user", "timestamp": 1}},
+  {"type": "compaction", "id": "ocp", "timestamp": stamp, "runtime": runtime, "summary": "s", "firstKeptEntryId": "ou", "tokensBefore": 900, "usage": usage(700)},
+])
+
+parsed = {"files": set(), "lines": 0, "reread": set()}
+pi_rows, pi_contexts = collectors._pi_rows, collectors._pi_contexts
+
+
+def counting_rows(path, lines, accept):
+  parsed["files"].add(Path(path).name)
+  parsed["lines"] += len(lines)
+  return pi_rows(path, lines, accept)
+
+
+def counting_contexts(path, lines):
+  parsed["reread"].add(Path(path).name)
+  return pi_contexts(path, lines)
+
+
+collectors._pi_rows = counting_rows
+collectors._pi_contexts = counting_contexts
+
+
+def scan(provider):
+  for key in parsed:
+    parsed[key] = set() if key != "lines" else 0
+  pattern = r'"provider"\s*:\s*"' + provider + '"'
+  return collectors.scan_pi_sessions(pattern, lambda name, model, entry: name == provider)
+
+
+rows, complete = scan("nobody")
+check("a scan for a provider with no sessions parses no line and rereads no file",
+      complete and not rows and not parsed["files"] and not parsed["reread"] and parsed["lines"] == 0, json.dumps({**parsed, "files": sorted(parsed["files"]), "reread": sorted(parsed["reread"])}))
+
+rows, complete = scan("demo")
+check("a scan parses only the files holding its own lines, the omp switch's included",
+      complete and parsed["files"] == {"mine.jsonl", "omp-compacted.jsonl"} and parsed["reread"] <= {"mine.jsonl", "omp-compacted.jsonl"},
+      json.dumps({"files": sorted(parsed["files"]), "reread": sorted(parsed["reread"])}))
+check("its own replies, prompts and compactions still count",
+      sorted((row.model, row.input_tokens, row.prompts) for row in rows)
+      == [("demo-model", 1000, 1), ("demo-model", 1001, 0), ("demo-model", 1002, 0), ("omp-model", 700, 0)],
+      json.dumps([row._asdict() for row in rows]))
+
+rows, complete = scan("other1")
+check("another provider's scan parses only its own ten files",
+      complete and len(parsed["files"]) == 10 and all(name.startswith("other-") for name in parsed["files"]) and len(rows) == 30,
+      json.dumps({"files": sorted(parsed["files"]), "rows": len(rows)}))
+PY

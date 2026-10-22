@@ -75,7 +75,17 @@ if [[ -n ${MISE_PRERELEASES:-} ]]; then
   printf 'prereleases=%s %s\n' "$MISE_PRERELEASES" "$*" >>"$OMARCHY_TEST_MISE_HISTORY"
 fi
 
-if [[ $1 == "where" ]]; then
+if [[ $1 == "tool" && $3 == "--backend" ]]; then
+  case "$2" in
+  npm:*) printf '%s\n' "$2" ;;
+  amp) printf '%s\n' "npm:@ampcode/cli" ;;
+  qwen) printf '%s\n' "npm:@qwen-code/qwen-code" ;;
+  *) printf '%s\n' "aqua:example/$2" ;;
+  esac
+  exit 0
+fi
+
+if [[ $1 == "where" || $1 == "which" ]]; then
   [[ ${OMARCHY_TEST_AGENT_INSTALLED:-false} == "true" ]]
   exit
 fi
@@ -855,7 +865,12 @@ for agent in qwen dsh mcode kiro-cli freebuff kilo devin amp commandcode; do
   declared_tool=${!tool_var:-${!package_var}}
   : >"$mise_history"
   omarchy-default-agent --install "$agent" >/dev/null
-  grep -Fx "install $declared_tool" "$mise_history" >/dev/null || fail "visible $agent installation installs Omarchy's declaration"
+  # npm-backed agents bring node along, which a fresh machine doesn't have yet.
+  case "$agent" in
+  kiro-cli | devin) expected_install="install $declared_tool" ;;
+  *) expected_install="install node $declared_tool" ;;
+  esac
+  grep -Fx "$expected_install" "$mise_history" >/dev/null || fail "visible $agent installation installs Omarchy's declaration (expected: $expected_install)"
   : >"$mise_history"
   OMARCHY_TEST_AGENT_INSTALLED=true omarchy-default-agent "$agent" >/dev/null
   grep -Fx "where $declared_tool" "$mise_history" >/dev/null || fail "$agent selection looks for Omarchy's declaration"
@@ -977,7 +992,7 @@ assert_launch kiro-cli kiro-cli chat --trust-all-tools -- "Review this project"
 assert_launch freebuff freebuff
 assert_launch kilo kilo --auto "--prompt=Review this project"
 assert_launch devin devin --permission-mode dangerous --respect-workspace-trust false -- "Review this project"
-assert_launch amp bash -c 'printf "%s\n" "$1" | exec amp --dangerously-allow-all' amp "Review this project"
+assert_launch amp bash -c 'printf "%s\n" "$1" | exec "$0" --dangerously-allow-all' amp "Review this project"
 assert_launch commandcode commandcode --yolo -- "Review this project"
 [[ $(<"$clipboard_log") == "Review this project" ]] || fail "Freebuff launcher puts the prompt on the clipboard"
 mapfile -d '' -t notification_args <"$notification_history"
@@ -1166,13 +1181,28 @@ fi
 pass "OpenClaw's agent hands a missing command to its launcher only when the package is there"
 
 # Native lazy shims can precede ~/.local/bin. The agent launcher must still run
-# the official command when the default-agent selector recognized one.
-for agent in cursor-agent muse; do
+# the official command when the default-agent selector recognized one, for
+# every agent and whether or not it is wrapped in env or bash.
+lazy_shims="$test_tmp/lazy-shims"
+mkdir -p "$lazy_shims"
+for agent in cursor-agent muse claude kiro-cli devin amp dsh hermes; do
   printf '#!/bin/bash\nprintf "official %s\\n"\n' "$agent" >"$test_home/.local/bin/$agent"
-  chmod +x "$test_home/.local/bin/$agent"
+  printf '#!/bin/bash\nprintf "lazy shim %s\\n"\n' "$agent" >"$lazy_shims/$agent"
+  chmod +x "$test_home/.local/bin/$agent" "$lazy_shims/$agent"
   printf '%s\n' "$agent" >"$agent_file"
-  output=$("$ROOT/bin/omarchy-agent" --inline)
+  output=$(PATH="$lazy_shims:$PATH" "$ROOT/bin/omarchy-agent" --inline)
   [[ $output == "official $agent" ]] || fail "agent launcher preserves the user-installed $agent ahead of a mise shim"
-  rm "$test_home/.local/bin/$agent"
+  output=$(PATH="$lazy_shims:$PATH" omarchy-agent-prompt --inline "Review this project")
+  [[ $output == "official $agent" ]] || fail "prompted agent launcher preserves the user-installed $agent ahead of a mise shim"
+  # Once mise has its own copy installed, a terminal runs that one, so the
+  # launcher does too rather than a leftover install in ~/.local/bin.
+  output=$(OMARCHY_TEST_AGENT_INSTALLED=true PATH="$lazy_shims:$PATH" "$ROOT/bin/omarchy-agent" --inline)
+  [[ $output == "lazy shim $agent" ]] || fail "agent launcher runs mise's installed $agent over a leftover ~/.local/bin copy"
+  # An older wrapper set its variable on the install line; it is still a
+  # wrapper, not the user's own install.
+  printf '#!/bin/bash\nMISE_MINIMUM_RELEASE_AGE=0 mise use -g --quiet "%s" || exit 1\nprintf "old wrapper %s\\n"\n' "$agent" "$agent" >"$test_home/.local/bin/$agent"
+  output=$(PATH="$lazy_shims:$PATH" "$ROOT/bin/omarchy-agent" --inline)
+  [[ $output == "lazy shim $agent" ]] || fail "agent launcher treats an older one-line mise wrapper for $agent as a wrapper"
+  rm "$test_home/.local/bin/$agent" "$lazy_shims/$agent"
 done
-pass "agent launcher runs user-installed Cursor and Muse ahead of native lazy shims"
+pass "agent launcher runs user-installed agents ahead of native lazy shims"

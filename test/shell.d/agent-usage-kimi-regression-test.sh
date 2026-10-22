@@ -2,9 +2,9 @@
 
 # The Kimi collector's own sources: the key in KIMI_API_KEY or the sign-in the
 # Kimi CLI keeps (refreshed under the CLI's own lock), the hosts a token may
-# go to, and Kimi's quota answers. Kimi keeps no local history, so there is
-# no scan cache; the unused-machine record is held centrally by the partition
-# test and the limits cache by the contract checks.
+# go to, and Kimi's quota answers. Kimi Code's local stats are held by
+# agent-usage-kimi-stats-test.sh, the unused-machine record centrally by the
+# partition test, and the limits cache by the contract checks.
 #
 # Each case runs in a fresh sandbox against a real stand-in for Kimi's
 # services, which every https:// request is carried to. Set
@@ -110,6 +110,23 @@ def stores(root):
   expect("the kimi-code store wins over the legacy one", load_collector("kimi").credentials_dir(), home() / ".kimi-code" / "credentials")
 
 
+# kimi-cli keeps its sign-in under KIMI_SHARE_DIR when that is set
+# (kimi_cli/share.py), refreshed under the file lock beside it.
+def share_dir(root):
+  del os.environ["KIMI_CODE_HOME"]
+  share = root / "share dir"
+  os.environ["KIMI_SHARE_DIR"] = str(share)
+  try:
+    write_json(share / "credentials" / "kimi-code.json", {"access_token": "AT_old", "refresh_token": "RT_old", "expires_at": time.time() - 10})
+    expect("the legacy kimi-cli store follows KIMI_SHARE_DIR", load_collector("kimi").credentials_dir(), share / "credentials")
+    scanner = load_collector("kimi")
+    token = scanner.api_key()
+    expect("a KIMI_SHARE_DIR sign-in is refreshed under its own file lock",
+           [token, (share / "credentials" / "kimi-code.lock").is_file(), (share / "oauth").exists()], ["AT_new", True, False])
+  finally:
+    del os.environ["KIMI_SHARE_DIR"]
+
+
 def home_isolation(root):
   default = home() / ".kimi-code" / "credentials"
   default.mkdir(parents=True)
@@ -151,6 +168,17 @@ def cli_lock(root):
   finally:
     thread.join()
   expect("the collector waits out the Kimi CLI's refresh lock and takes its token", [token, len(reqs)], ["AT_peer", 0])
+
+
+def stale_lock(root):
+  credentials()
+  lock = root / "code home" / "oauth" / "kimi-code.lock"
+  lock.mkdir(parents=True)
+  os.utime(lock, (0, 0))
+  started = time.monotonic()
+  token = scanner.api_key()
+  expect("a lease left by a CLI that died is taken over, not waited out",
+         [token, time.monotonic() - started < 5, lock.exists()], ["AT_new", True, False])
 
 
 def lock_failure(root):
@@ -314,8 +342,8 @@ def modern_quota(root):
   expect("the current CLI's quota windows are read, the monthly code allowance titled",
          [[row["percent"] for row in data["limits"]], data["limits"][0]["resetsAt"], data["limits"][-1].get("title")],
          [[0.25, 0.8, 1, 0], RESET_AT, "Code Monthly"], data)
-  expect("Kimi's quota is the account's, not local history",
-         [data["scope"], data["hasLocalStats"], data["hasPromptStats"]], ["account", False, False], data)
+  expect("Kimi's quota is this machine's record, with no local stats while no session has run",
+         [data.get("scope"), data["hasLocalStats"], data["hasPromptStats"]], [None, False, True], data)
   scanner.USAGE_URL = "https://api.kimi.ai/coding/v1/usages"
   record()
   expect("the global Kimi service gets the authorization header too", auth_header(), "Bearer AT_env")
@@ -338,6 +366,15 @@ def legacy_quota(root):
     {"label": "Weekly limit", "percent": 0.33, "resetsAt": "2026-08-23T11:52:13.042087Z"},
     {"label": "Session (5-hour)", "percent": 0.66, "resetsAt": "2026-08-17T16:52:13Z"},
     {"label": "Weekly quota", "percent": 0.25, "resetsAt": ""}], data)
+
+
+def odd_resets(root):
+  os.environ["KIMI_API_KEY"] = "AT_env"
+  odd = ("garbage", "2030-13-45", "99999999999999999999999", "9" * 5000, "-5", "1e10", True, [1])
+  for value in odd:
+    state["payload"] = {"usages": {"limit_5h": {"used_ratio": 0.5, "reset_time": value}}}
+    data = record()
+    expect(f"a reset time that won't parse names no reset ({str(value)[:30]})", [row["resetsAt"] for row in data["limits"]], [""], data)
 
 
 # ------------------------------------------------------------------ the cache
@@ -371,6 +408,17 @@ def empty_answer(root):
          [first["limits"], second["limits"], second["usageStatusText"], len(reqs)], [[], [], "", 1], second)
 
 
+def odd_answer(root):
+  os.environ["KIMI_API_KEY"] = "AT_env"
+  good = record()
+  state["payload"] = {"something": "else"}
+  data = record()
+  expect("an answer of another shape keeps the last good limits, stale",
+         [data["limits"] == good["limits"], data["limitsStale"], data["limitsFetchedAt"] == good["limitsFetchedAt"], data.get("retryAdvised")],
+         [True, True, True, None], data)
+  expect("an answer of another shape never replaces the cached one", run_main(scanner, "--limits-only")["limits"], good["limits"])
+
+
 def switched_cache(root):
   credentials("AT_account_a", time.time() + 3600)
   capture = scanner.api_key
@@ -387,13 +435,14 @@ def switched_cache(root):
   expect("an answer is never kept under a token it wasn't asked with", record()["limits"], [])
 
 
-cases = {"contract": contract, "env_key": env_key, "stores": stores, "home": home_isolation, "static": static_token,
-         "refresh": refresh, "cli_lock": cli_lock, "lock_failure": lock_failure, "heartbeat": heartbeat,
+cases = {"contract": contract, "env_key": env_key, "stores": stores, "share_dir": share_dir, "home": home_isolation, "static": static_token,
+         "refresh": refresh, "cli_lock": cli_lock, "stale_lock": stale_lock,"lock_failure": lock_failure, "heartbeat": heartbeat,
          "private_write": private_write, "concurrent_signin": concurrent_signin, "concurrent_logout": concurrent_logout,
          "invalid_grant": invalid_grant, "refused_refresh": refused_refresh, "key_help": key_help, "refused": refused,
          "waiting_for_auth": waiting_for_auth, "trust": trust, "destination": destination, "redirects": redirects,
          "quota": modern_quota, "legacy_quota": legacy_quota, "cache_identity": cache_identity,
-         "rotation_cache": rotated_cache, "switched_cache": switched_cache, "empty_answer": empty_answer}
+         "rotation_cache": rotated_cache, "switched_cache": switched_cache, "empty_answer": empty_answer,
+         "odd_answer": odd_answer, "odd_resets": odd_resets}
 selected = os.environ.get("OMARCHY_TEST_KIMI_CASE")
 for name, case in cases.items():
   if selected and name != selected:

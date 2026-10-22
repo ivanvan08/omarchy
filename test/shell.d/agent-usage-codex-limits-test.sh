@@ -65,7 +65,7 @@ login("ws-one", "user-a")
 fresh = check_limits_contract(Adapter("codex", serve=serve, count=starts, refused_status="Waiting for auth", retry_modes=("down",),
                                       skip=("cut",)))
 expect("fresh Codex limits read both windows and the plan",
-       [[entry["percent"] for entry in fresh["limits"]], fresh["tierLabel"]], [[0.4, 0.7], "pro"], fresh)
+       [[entry["percent"] for entry in fresh["limits"]], fresh["tierLabel"]], [[0.4, 0.7], "Pro 200"], fresh)
 
 # ------------------------------------------------------- a failed probe
 
@@ -79,18 +79,18 @@ for mode, retry, status in (("backend", False, ""), ("died", True, ""), ("crashe
   expect(f"a failed Codex probe ({mode}) keeps the last limits, stale, and says what went wrong", {
     "limits": kept["limits"] == good["limits"], "stale": kept["limitsStale"], "at": kept["limitsFetchedAt"] == good["limitsFetchedAt"],
     "tier": kept["tierLabel"], "status": kept["usageStatusText"], "help": bool(kept["authHelpText"]), "retry": kept.get("retryAdvised", False),
-  }, {"limits": True, "stale": True, "at": True, "tier": "pro", "status": status, "help": True, "retry": retry}, kept)
+  }, {"limits": True, "stale": True, "at": True, "tier": "Pro 200", "status": status, "help": True, "retry": retry}, kept)
 
 # A plan without windows is an answer too: a later failed probe has no limits
 # to lose, so it is no trouble, whatever went wrong. A sign-out still says so.
 no_windows = codex("ok", CODEX_RATE_LIMITS=json.dumps({"planType": "free"}))
-expect("a Codex plan without windows is a healthy answer", [no_windows["limits"], no_windows["usageStatusText"], no_windows["tierLabel"]], [[], "", "free"], no_windows)
+expect("a Codex plan without windows is a healthy answer", [no_windows["limits"], no_windows["usageStatusText"], no_windows["tierLabel"]], [[], "", "Free"], no_windows)
 for mode, retry, status in (("backend", False, ""), ("died", True, ""), ("crashed", False, ""), ("auth", False, "Waiting for auth")):
   failed = codex(mode)
   expect(f"a failed Codex probe ({mode}) after a plan without windows is no trouble", {
     "limits": failed["limits"], "tier": failed["tierLabel"], "status": failed["usageStatusText"], "help": bool(failed["authHelpText"]),
     "retry": failed.get("retryAdvised", False),
-  }, {"limits": [], "tier": "free", "status": status, "help": bool(status), "retry": retry}, failed)
+  }, {"limits": [], "tier": "Free", "status": status, "help": bool(status), "retry": retry}, failed)
 good = codex("ok")
 
 # A stall costs the app-server's whole 8-second answer timeout, so this run's
@@ -182,7 +182,7 @@ before_starts = starts()
 reused = codex("ok", "--limits-only", CODEX_RATE_LIMITS=json.dumps({"planType": "free"}))
 expect("an answer without windows stands in for the next probe",
        [bare["limits"], bare["tierLabel"], reused["limits"], reused["tierLabel"], reused["limitsStale"], starts() - before_starts],
-       [[], "free", [], "free", False, 0], reused)
+       [[], "Free", [], "Free", False, 0], reused)
 
 # ------------------------------------------------------------ a spend cap
 
@@ -258,7 +258,7 @@ def entry(percent, label="5h window", title=None):
   return result
 
 
-def reads(name, payload, expected, plan="pro", account_read=False, reset_credits=None):
+def reads(name, payload, expected, plan="Pro 200", account_read=False, reset_credits=None):
   calls.write_text("")
   os.environ["RPC_LIMITS"] = json.dumps(payload)
   result = load_collector("codex").fetch_codex_rpc(codex_home)
@@ -298,10 +298,10 @@ reads("legacy plan metadata is retained when map buckets omit it", {
 }, [entry(33)])
 reads("account metadata remains an optional plan fallback", {
   "rateLimitsByLimitId": {"codex": {"primary": window(33)}}
-}, [entry(33)], plan="plus", account_read=True)
+}, [entry(33)], plan="Plus", account_read=True)
 reads("malformed legacy metadata does not erase valid map limits", {
   "rateLimits": [], "rateLimitsByLimitId": {"codex": {"primary": window(33)}}
-}, [entry(33)], plan="plus", account_read=True)
+}, [entry(33)], plan="Plus", account_read=True)
 reads("a weekly model bucket attaches to the weekly window", {
   "rateLimitsByLimitId": {"codex": legacy, "codex_spark": {"limitName": "Spark", "secondary": window(30, 10080)}}
 }, [entry(12), entry(30, "Weekly (7-day)", "Spark Weekly")])
@@ -335,4 +335,13 @@ reads("a spend cap without usable amounts reads its reported percentage", {
 reads("an untrusted spend cap costs only its own meter", {
   "rateLimits": dict(legacy, individualLimit={"limit": "6000", "used": "lots", "remainingPercent": float("nan")})
 }, [entry(12)])
+
+# The plan reads as Codex 0.163's /status names it (SubscriptionDisplay::Status),
+# not as its wire planType, and one newer than that keeps its wire name.
+for wire, shown in (("free", "Free"), ("go", "Go"), ("plus", "Plus"), ("pro", "Pro 200"), ("prolite", "Pro 100"), ("promax", "Pro 500"),
+                    ("team", "Business"), ("self_serve_business_usage_based", "Business"), ("self_serve_business_prolite", "Business Premium"),
+                    ("business", "Enterprise"), ("enterprise_cbp_automation", "Enterprise (Automation)"), ("enterprise_cbp_usage_based", "Enterprise"),
+                    ("ent26", "Enterprise"), ("enterprise", "Enterprise"), ("edu", "Edu"), ("edu_plus", "Edu Plus"), ("edu_pro", "Edu Pro"),
+                    ("ultra_max", "ultra max")):
+  reads(f"the {wire} plan reads as {shown!r}", {"rateLimits": dict(legacy, planType=wire)}, [entry(12)], plan=shown)
 PY

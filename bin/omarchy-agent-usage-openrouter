@@ -4,8 +4,11 @@
 # omarchy:hidden=true
 """Collect OpenRouter usage into one display-ready JSON record.
 
-Tier 1 (any API key): balance and key usage come from GET /api/v1/credits
-and GET /api/v1/key; token stats come from the local opencode SQLite DB
+Tier 1 (any API key): key usage comes from GET /api/v1/key, and the balance
+from GET /api/v1/credits, asked with the management key when there is one
+(OpenRouter documents it as management-key only, and an inference key it
+refuses isn't asked again for a day); token stats come from the local
+opencode SQLite DB
 (providerID == "openrouter", role == "assistant") and from pi/omp session
 files whose assistant messages ran on the openrouter provider, read-only.
 Each key keeps its own last good meter and balance, shown stale when a
@@ -48,9 +51,11 @@ from collectors import (  # noqa: E402
   cached_scan,
   config_home,
   data_home,
+  dsh_home,
   emit,
   empty_bucket,
   empty_stats,
+  kimchi_sessions_root,
   limits_cache_path,
   now_ms,
   number,
@@ -59,10 +64,14 @@ from collectors import (  # noqa: E402
   opencode_db,
   pi_session_roots,
   read_json,
+  routed_match,
+  routed_sources,
   scan_cache_paths as shared_scan_cache_paths,
+  scan_dsh_sessions,
   scan_max_age,
   scan_opencode as shared_scan_opencode,
   scan_pi_sessions,
+  scan_routed,
   stamp,
   warn,
   write_json,
@@ -182,8 +191,8 @@ def summarize_activity(items: list[Any], today: datetime) -> dict[str, Any]:
   """Fold /activity rows into the panel's stats dict.
 
   One row per (date, endpoint): prompt tokens count as input, and completion
-  and reasoning tokens as output (thinking is generated, so it is output, as
-  the collector contract has it). The billing API reports
+  tokens, reasoning among them, as output (thinking is generated, so it is
+  output, as the collector contract has it). The billing API reports
   tokens, never prompt or session counts, so hasPromptStats stays False
   and the panel keeps those numbers out of today's tooltip.
   """
@@ -200,14 +209,16 @@ def summarize_activity(items: list[Any], today: datetime) -> dict[str, Any]:
     day = activity_day(raw.get("date"))
     model = model_name(str(raw.get("model_permaslug") or raw.get("model") or ""))
     prompt = number(raw.get("prompt_tokens"))
-    reasoning = number(raw.get("reasoning_tokens"))
-    output = number(raw.get("completion_tokens"))
-    total = prompt + reasoning + output
+    # Reasoning is part of the completion count, as in OpenRouter's usage
+    # (its own AI SDK provider reads text = completion - reasoning), so it
+    # is never added again; a row naming reasoning alone still counts it.
+    output = max(number(raw.get("completion_tokens")), number(raw.get("reasoning_tokens")))
+    total = prompt + output
     if total <= 0:
       continue
     bucket = model_usage.setdefault(model, empty_bucket())
     bucket["inputTokens"] += prompt
-    bucket["outputTokens"] += output + reasoning
+    bucket["outputTokens"] += output
     if day:
       active_dates.add(day)
     if day in recent:
@@ -286,24 +297,44 @@ def scan_opencode(stats: Stats) -> bool:
   return complete
 
 
+def pi_roots() -> list[Path]:
+  # Kimchi's harness keeps pi-format sessions of its own, and one run with
+  # `--provider openrouter` is OpenRouter's.
+  return [*pi_session_roots(), kimchi_sessions_root()]
+
+
 def scan_pi(stats: Stats) -> bool:
-  """Add pi/omp messages on the openrouter provider. Returns whether every
-  session file could be read, like scan_opencode."""
-  rows, complete = scan_pi_sessions(r'"provider"\s*:\s*"openrouter"', billed_here)
+  """Add pi/omp and Kimchi messages on the openrouter provider. Returns
+  whether every session file could be read, like scan_opencode."""
+  rows, complete = scan_pi_sessions(r'"provider"\s*:\s*"openrouter"', billed_here, pi_roots())
+  for row in rows:
+    stats.add_row(row, model_name(row.model))
+  return complete
+
+
+def scan_dsh(stats: Stats) -> bool:
+  """Add DeepSeek Harness attempts on its pi-ai adapter's openrouter route."""
+  rows, complete = scan_dsh_sessions(lambda provider, model, request: provider == PROVIDER)
   for row in rows:
     stats.add_row(row, model_name(row.model))
   return complete
 
 
 def scan_local(stats: Stats) -> bool:
-  # Both sources always run, so one failing still leaves the other's numbers.
+  # Every source always runs, so one failing still leaves the others' numbers.
   opencode_complete = scan_opencode(stats)
   pi_complete = scan_pi(stats)
-  return opencode_complete and pi_complete
+  dsh_complete = scan_dsh(stats)
+  # Claude Code pointed at OpenRouter's Anthropic-compatible API, and MiniMax
+  # Code's custom providers (its OpenRouter preset among them) at OpenRouter.
+  routed_rows, routed_complete = scan_routed(AGENT_ID)
+  for row in routed_rows:
+    stats.add_row(row, model_name(row.model))
+  return opencode_complete and pi_complete and dsh_complete and routed_complete
 
 
 def scan_sources() -> list[Path]:
-  return [opencode_db(), *pi_session_roots()]
+  return [opencode_db(), *pi_roots(), dsh_home(), *routed_sources()]
 
 
 def scan_cache_paths() -> tuple[Path, Path]:
@@ -323,7 +354,7 @@ def cached_local_stats(max_age: float) -> tuple[dict, bool]:
     complete = scan_local(stats)
     return stats.snapshot(), complete
 
-  return cached_scan(AGENT_ID, scan_sources(), max_age, scan, with_complete=True)
+  return cached_scan(AGENT_ID, scan_sources(), max_age, scan, match=routed_match(), with_complete=True)
 
 
 # ---------------------------------------------------------------- record
@@ -335,6 +366,11 @@ def base_record(**overrides: Any) -> dict:
 # A key with a credit limit drains toward empty. limit_reset names how often
 # the limit starts over (daily, weekly, monthly), not when, so it labels the
 # meter rather than giving it a reset time.
+# How long an inference key /credits refused goes unasked: OpenRouter
+# documents the endpoint as management-key only, so it answers the same
+# until the key's permissions change.
+CREDITS_REFUSAL_SECONDS = 24 * 3600
+
 KEY_LIMIT_PERIODS = {"daily": "Daily", "weekly": "Weekly", "monthly": "Monthly"}
 
 
@@ -428,8 +464,8 @@ def collect_billing(key: str, manager: str, force: bool) -> dict[str, Any]:
   """The key-limit meter and the balance, each kept past a failed check.
 
   The meter describes an inference key's own credit limit, so with only a
-  management key there is none to show; the balance is the account's and
-  either key can read it.
+  management key there is none to show; the balance is the account's, and
+  an inference key reads it only where OpenRouter still lets it.
   """
   result: dict[str, Any] = {
     "limits": [], "limitsStale": False, "limitsFetchedAt": 0,
@@ -441,8 +477,26 @@ def collect_billing(key: str, manager: str, force: bool) -> dict[str, Any]:
     parts["key"], error = probe("/key", key, "limits", lambda data: {"limits": key_limit_meter(data)}, force)
     if error:
       errors["key"] = error
-  credits_key = key or manager
-  parts["credits"], error = probe("/credits", credits_key, "credits", lambda data: {"balance": credits_balance(data)}, force)
+  # OpenRouter documents /credits as management-key only, answering another
+  # key 403 "Only management keys can perform this operation". So the
+  # management key asks when there is one, and an inference key alone asks
+  # until it is refused that way, which is no balance for this key, not a
+  # refused key: /key says whether the key itself still works. The refusal
+  # is kept, so the next refreshes don't ask again. A management key that is
+  # refused itself (revoked, or no management key at all) leaves the
+  # inference key to ask.
+  error = None
+  if manager:
+    parts["credits"], error = probe("/credits", manager, "credits", lambda data: {"balance": credits_balance(data)}, force)
+  if key and (not manager or isinstance(error, OpenRouterAuthError)):
+    refusal = LimitsCache(AGENT_ID, key, kind="credits")
+    if refusal.data.get("refused") is True and refusal.younger_than(CREDITS_REFUSAL_SECONDS):
+      parts["credits"], error = None, None
+    else:
+      parts["credits"], error = probe("/credits", key, "credits", lambda data: {"balance": credits_balance(data)}, force)
+      if isinstance(error, OpenRouterAuthError) and error.code == 403:
+        refusal.save([], refused=True)
+        parts["credits"], error = None, None
   if error:
     errors["credits"] = error
 

@@ -244,6 +244,24 @@ expect("the meters are titled after the billing period",
        [limit["title"] for limit in record["limits"]], ["Monthly", "Auto models Monthly", "Named models Monthly", "On-demand $5.00 / $20.00 Monthly"], record)
 expect("an unknown reset is an empty string", sorted({limit["resetsAt"] for limit in record["limits"]}), [""], record)
 
+# A plan whose included allowance is weekly, as GetPlanInfoResponse.PlanInfo
+# says with included_usage_period and included_usage_resets_at, titles and
+# dates its included meters by the week; the on-demand budget stays on the
+# billing cycle.
+weekly_routes = dict(routes, **{
+  RPC + "GetCurrentPeriodUsage": dict(PERIOD, planUsage={"totalPercentUsed": 40, "autoPercentUsed": 20, "apiPercentUsed": 60}),
+})
+read = {}
+for period, reset in (("INCLUDED_USAGE_PERIOD_WEEKLY", "4091840726000"), ("WEEKLY", "4091840726"), (2, 4091840726000)):
+  weekly_routes[RPC + "GetPlanInfo"] = {"planInfo": {"planName": "Ultra", "includedUsagePeriod": period, "includedUsageResetsAt": reset}}
+  record = cursor(routes=weekly_routes)
+  read[str(period)] = [[limit["title"], limit["resetsAt"]] for limit in record["limits"]]
+WEEK_END, CYCLE_END = "2099-08-31T06:25:26+00:00", "2099-09-03T06:25:26+00:00"
+expect("a weekly included allowance reads Weekly and resets with the week", read, {
+  period: [["Weekly", WEEK_END], ["Auto models Weekly", WEEK_END], ["Named models Weekly", WEEK_END], ["On-demand $9.51 / $10.00 Monthly", CYCLE_END]]
+  for period in ("INCLUDED_USAGE_PERIOD_WEEKLY", "WEEKLY", "2")
+}, read)
+
 # GetPlanInfo failing leaves the plan the account last had.
 record = cursor(routes=dict(routes, **{RPC + "GetPlanInfo": 500}))
 expect("the plan is kept when GetPlanInfo fails", [record["tierLabel"], record["limitsStale"]], ["Ultra", False], record)

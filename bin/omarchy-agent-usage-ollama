@@ -5,13 +5,13 @@
 """Collect Ollama Cloud usage into one display-ready JSON record.
 
 Everything the agents panel shows for Ollama Cloud comes from this one
-command: local token stats from pi and omp sessions and from opencode's
-message database that ran on the `ollama-cloud` provider (or on a cloud model
-through the local daemon), and the account's allowance from Ollama's usage
-endpoint. Plans bought since Ollama's credit pricing are a monthly dollar
-allowance spent per token, shown as a balance; plans from before it keep their
-5-hour session and 7-day weekly windows. The panel itself only ever reads the
-JSON this prints; it never talks to disk formats or endpoints.
+command: local token stats from pi and omp sessions, opencode's message
+database, Codex's `--oss` rollouts and Claude Code's transcripts that ran on
+the `ollama-cloud` provider (or on a cloud model through the local daemon),
+and the account's 5-hour session and 7-day weekly
+limits (or the monthly included credits) from Ollama's balance endpoint. The
+panel itself only ever reads the JSON this prints; it never talks to disk
+formats or endpoints.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import os
 import sqlite3
 import sys
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,10 @@ from collectors import (  # noqa: E402
   Stats,
   base_record,
   cached_scan as shared_cached_scan,
+  cloud_model,
+  codex_home,
+  codex_rollout_cache,
+  codex_rollouts,
   config_home,
   emit,
   limits_cache_path as shared_limits_cache_path,
@@ -42,31 +47,29 @@ from collectors import (  # noqa: E402
   opencode_db,
   pi_session_roots,
   read_json,
+  routed_match,
+  routed_sources,
   scan_max_age,
   scan_opencode,
   scan_pi_sessions,
+  scan_routed,
 )
 
 AGENT_ID = "ollama"
 AGENT_NAME = "Ollama Cloud"
 PROVIDER = "ollama-cloud"
-# The last 30 days, Ollama's own longest range: the credit answer is the
-# account's spend per day, and the plan's monthly allowance is measured
-# against it.
-USAGE_ENDPOINT = "https://ollama.com/api/usage?range=30d"
+BALANCE_ENDPOINT = "https://ollama.com/api/balance"
 ME_ENDPOINT = "https://ollama.com/api/me"
-# The usage credit each plan includes every month (ollama.com/pricing). The
-# usage endpoint reports what was spent but not what the plan includes, so the
-# funded side of the balance comes from here; a plan not listed (Free, which
-# includes a starter amount Ollama doesn't publish) shows no balance.
-INCLUDED_CREDITS_USD = {"pro": 60.0, "max": 300.0}
 AUTH_HELP_NO_KEY = "Set OLLAMA_API_KEY, or sign in to pi or omp with an Ollama Cloud key, to show the account limits."
 AUTH_HELP_BAD_KEY = (
   "Ollama Cloud rejected the API key. Update OLLAMA_API_KEY or ~/.config/omarchy/agents/ollama.json,"
   " or sign in to pi again. Local stats are still shown."
 )
-# The usage endpoint reports how much of each window is used but not when it
-# resets, so the limits carry no reset time rather than a guessed one.
+# GET /api/balance (docs.ollama.com/api/balance) answers a legacy plan with
+# `included.session` / `included.weekly` ({remaining_percent 0..100,
+# resets_at}) and a current plan with `included.balance_usd`,
+# `allowance_usd` and `period.until`. /api/usage only reports token and cost
+# history, never the limits.
 
 
 def config_dir() -> Path:
@@ -130,7 +133,7 @@ def api_key() -> str:
   if configured:
     return configured
   # pi and omp store the Ollama Cloud key they signed in with; either one
-  # proves the account, and the usage endpoint accepts the same key.
+  # proves the account, and the balance endpoint accepts the same key.
   pi_key = literal_key(read_json(pi_agent_dir() / "auth.json").get(PROVIDER))
   if pi_key:
     return pi_key
@@ -145,43 +148,62 @@ def api_key() -> str:
 # Ollama Cloud API, which serves Claude models alongside the open ones. A
 # cloud-tagged model ("glm-4.6:cloud", "gpt-oss:120b-cloud") reached through
 # the local daemon's `ollama` provider runs on Ollama's servers too, so it
-# counts here; the local collector leaves exactly those out.
-
-
-def is_cloud_model(model: str) -> bool:
-  tag = model.lower().rpartition(":")[2] if ":" in model else ""
-  return tag == "cloud" or tag.endswith("-cloud")
+# counts here; the local collector leaves exactly those out. Codex's `--oss`
+# rollouts name the same `ollama` provider, and count here on the same
+# models. Claude Code pointed at ollama.com, or answering with a cloud-tagged
+# model, is Ollama's too, as is a MiniMax Code custom provider at ollama.com.
 
 
 def billed_by_ollama_cloud(provider: str, model: str, entry: Any = None) -> bool:
-  return provider == PROVIDER or (provider == "ollama" and is_cloud_model(model))
+  return provider == PROVIDER or (provider == "ollama" and cloud_model(model))
 
 
-def scan_sessions(model_prefix: str) -> tuple[dict[str, Any], bool]:
+# Ollama model ids carry a version tag ("deepseek-v4-pro:0813"); merge tags
+# so the chart groups by model, not by release.
+def model_name(raw: str) -> str:
+  return (raw or "ollama").split(":", 1)[0]
+
+
+def scan_codex(stats: Stats, model_prefix: str, reuse: bool) -> bool:
+  """Codex rollouts on Ollama Cloud: the `--oss` daemon's cloud-tagged
+  models, or a model_providers entry named `ollama-cloud`, prompts counted
+  as Codex's typed ones. Returns whether every rollout was read."""
+  records, complete = codex_rollouts(codex_rollout_cache(AGENT_ID), reuse=reuse)
+  for key, record in records.items():
+    for day, models in record["days"].items():
+      for model, (input_tokens, output_tokens, cache_read, cache_write, prompts) in models.items():
+        name = model_name(model)
+        if billed_by_ollama_cloud(record["provider"], model) and not (model_prefix and not name.lower().startswith(model_prefix)):
+          stats.add(day, key, name, input_tokens, output_tokens, cache_read, cache_write, prompts=prompts)
+  return complete
+
+
+def scan_sessions(model_prefix: str, reuse: bool = True) -> tuple[dict[str, Any], bool]:
   stats = Stats()
   pi_rows, pi_complete = scan_pi_sessions(r'"provider"\s*:\s*"ollama(-cloud)?"', billed_by_ollama_cloud)
   # The database's prefilter matches both provider ids.
   db_rows, db_complete = scan_opencode(["ollama"], billed_by_ollama_cloud)
-  for row in pi_rows + db_rows:
-    # Ollama model ids carry a version tag ("deepseek-v4-pro:0813"); merge
-    # tags so the chart groups by model, not by release.
-    model = (row.model or "ollama").split(":", 1)[0]
+  routed_rows, routed_complete = scan_routed(AGENT_ID)
+  for row in pi_rows + db_rows + routed_rows:
+    model = model_name(row.model)
     if model_prefix and not model.lower().startswith(model_prefix):
       continue
     stats.add_row(row, model)
-  return stats.snapshot(), pi_complete and db_complete
+  codex_complete = scan_codex(stats, model_prefix, reuse)
+  return stats.snapshot(), pi_complete and db_complete and codex_complete and routed_complete
 
 
 def cached_scan(max_age_seconds: float, model_prefix: str) -> dict[str, Any]:
   # The digest covers every data path the scan reads: the pi/omp session
-  # roots and the opencode DB. A scan only answers for the model filter it
-  # applied.
+  # roots, the opencode DB, Codex's home, and Claude Code's and MiniMax
+  # Code's sessions. A scan only answers for the model filter it applied, and
+  # the endpoints those were sent to.
   return shared_cached_scan(
     AGENT_ID,
-    [*pi_session_roots(), opencode_db()],
+    [*pi_session_roots(), opencode_db(), codex_home(), *routed_sources()],
     max_age_seconds,
-    lambda: scan_sessions(model_prefix),
-    match={"modelPrefix": model_prefix},
+    lambda: scan_sessions(model_prefix, reuse=max_age_seconds > 0),
+    match={"modelPrefix": model_prefix, **routed_match()},
   )
 
 
@@ -194,9 +216,68 @@ def clamp_fraction(value: Any) -> float:
   return min(1.0, float(value))
 
 
+def reset_time(value: Any) -> str:
+  raw = value.strip() if isinstance(value, str) else ""
+  try:
+    datetime.fromisoformat(raw.replace("Z", "+00:00"))
+  except ValueError:
+    return ""
+  return raw
+
+
+def amount(value: Any) -> float | None:
+  if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    return None
+  return float(value)
+
+
+def balance_limits(payload: Any) -> list[dict[str, Any]]:
+  included = payload.get("included") if isinstance(payload, dict) else None
+  if not isinstance(included, dict):
+    return []
+  out = []
+  for key, label in (("session", "Session (5-hour)"), ("weekly", "Weekly (7-day)")):
+    window = included.get(key)
+    if not isinstance(window, dict):
+      continue
+    # remaining_percent runs 0..100 and says what is left, not what is used.
+    remaining = amount(window.get("remaining_percent"))
+    remaining = clamp_fraction(remaining / 100) if remaining is not None else -1.0
+    if remaining >= 0:
+      out.append({"label": label, "percent": 1.0 - remaining, "resetsAt": reset_time(window.get("resets_at"))})
+  balance, allowance = amount(included.get("balance_usd")), amount(included.get("allowance_usd"))
+  if balance is not None and allowance is not None and allowance > 0:
+    period = included.get("period")
+    out.append({
+      "label": "Included credits",
+      "title": "Monthly",
+      "percent": max(0.0, min(1.0, (allowance - balance) / allowance)),
+      "resetsAt": reset_time(period.get("until")) if isinstance(period, dict) else "",
+    })
+  return out
+
+
+# The credits bought apart from the plan: purchased.balance_usd, what's left
+# of them unexpired. The answer says how much remains but not how much was
+# bought, so the balance shows the remaining figure alone. A plan that never
+# bought any, or used them up, has none to show, and that is no alarm while
+# the plan's included credits still serve.
+def purchased_balance(payload: Any) -> dict[str, Any] | None:
+  purchased = payload.get("purchased") if isinstance(payload, dict) else None
+  remaining = amount(purchased.get("balance_usd")) if isinstance(purchased, dict) else None
+  if remaining is None or remaining <= 0:
+    return None
+  return {"remaining": remaining, "funded": 0, "spent": 0, "currency": "USD", "estimated": False}
+
+
+def kept_balance(cache: LimitsCache) -> dict[str, Any] | None:
+  balance = cache.data.get("balance")
+  return balance if isinstance(balance, dict) else None
+
+
 def probe_limits(access_key: str) -> dict[str, Any]:
   request = urllib.request.Request(
-    USAGE_ENDPOINT,
+    BALANCE_ENDPOINT,
     headers={"Authorization": "Bearer " + access_key, "Accept": "application/json"},
   )
   try:
@@ -205,7 +286,7 @@ def probe_limits(access_key: str) -> dict[str, Any]:
     if error.status in (401, 403):
       return {"ok": False, "auth": True, "helpText": AUTH_HELP_BAD_KEY}
     if error.status:
-      return {"ok": False, "helpText": f"Ollama's usage endpoint returned status {error.status}. Local stats are still shown."}
+      return {"ok": False, "helpText": f"Ollama's balance endpoint returned status {error.status}. Local stats are still shown."}
     if error.transport:
       # A transport failure reached no server at all — no route, no DNS. Any
       # real answer, including an error status, is a server we should stop
@@ -213,54 +294,15 @@ def probe_limits(access_key: str) -> dict[str, Any]:
       return {
         "ok": False,
         "transport": True,
-        "helpText": "Couldn't reach Ollama's usage endpoint. Retrying shortly. Local stats are still shown.",
+        "helpText": "Couldn't reach Ollama's balance endpoint. Retrying shortly. Local stats are still shown.",
       }
-    return {"ok": False, "helpText": "Ollama's usage endpoint returned an invalid answer. Local stats are still shown."}
+    return {"ok": False, "helpText": "Ollama's balance endpoint returned an invalid answer. Local stats are still shown."}
 
-  if not isinstance(payload, dict):
-    return {"ok": False, "helpText": "Ollama's usage endpoint returned no limits. Local stats are still shown."}
-
-  # A plan on Ollama's credit pricing has no windows: the answer is what the
-  # account spent, in dollars, over the range asked for.
-  limits = payload.get("limits")
-  if not isinstance(limits, dict):
-    totals = payload.get("totals")
-    spent = totals.get("usage_usd") if isinstance(totals, dict) else None
-    if isinstance(spent, bool) or not isinstance(spent, (int, float)) or not math.isfinite(spent) or spent < 0:
-      return {"ok": False, "helpText": "Ollama's usage endpoint returned no limits. Local stats are still shown."}
-    return {"ok": True, "limits": [], "spent": float(spent)}
-
-  out = []
-  session = limits.get("session")
-  weekly = limits.get("weekly")
-  if isinstance(session, dict):
-    percent = clamp_fraction(session.get("usage"))
-    if percent >= 0:
-      out.append({"label": "Session (5-hour)", "percent": percent, "resetsAt": ""})
-  if isinstance(weekly, dict):
-    percent = clamp_fraction(weekly.get("usage"))
-    if percent >= 0:
-      out.append({"label": "Weekly (7-day)", "percent": percent, "resetsAt": ""})
-  if not out:
-    return {"ok": False, "helpText": "Ollama's usage endpoint returned no limits. Local stats are still shown."}
-  return {"ok": True, "limits": out}
-
-
-# The plan's monthly credit against the last 30 days' spend. An estimate: the
-# credit resets on the subscription's own day of the month, which Ollama's API
-# doesn't name, so a rolling 30 days stands in for the current month. Spend
-# past the credit draws on bought credits, so the balance stops at zero.
-def credit_balance(plan: str, spent: float | None) -> dict[str, Any] | None:
-  funded = INCLUDED_CREDITS_USD.get(plan.lower())
-  if spent is None or not funded:
-    return None
-  return {
-    "remaining": round(max(0.0, funded - spent), 2),
-    "funded": funded,
-    "spent": round(spent, 2),
-    "currency": "USD",
-    "estimated": True,
-  }
+  out = balance_limits(payload)
+  balance = purchased_balance(payload)
+  if not out and balance is None:
+    return {"ok": False, "helpText": "Ollama's balance endpoint returned no limits. Local stats are still shown."}
+  return {"ok": True, "limits": out, "balance": balance}
 
 
 def probe_plan(access_key: str) -> str | None:
@@ -274,7 +316,9 @@ def probe_plan(access_key: str) -> str | None:
     payload = open_json(request, timeout=10)
   except Exception:
     return None
-  plan = str(payload.get("Plan") or "").strip()[:64] if isinstance(payload, dict) else ""
+  # Ollama's UserResponse tags the field `plan`; Go's decoder takes either
+  # case, so `Plan` is read too.
+  plan = str(payload.get("plan") or payload.get("Plan") or "").strip()[:64] if isinstance(payload, dict) else ""
   return plan[0].upper() + plan[1:] if plan else ""
 
 
@@ -288,7 +332,7 @@ def collect_limits(access_key: str, force: bool) -> dict[str, Any]:
   # `live` says whether the limits are this check's (or a probe recent enough
   # to stand in for one), `fetchedAtMs` when they were measured, so the panel
   # can tell kept limits from fresh ones.
-  result = {"limits": [], "balance": None, "tierLabel": "", "usageStatusText": "", "authHelpText": "", "live": False, "fetchedAtMs": 0}
+  result = {"limits": [], "tierLabel": "", "usageStatusText": "", "authHelpText": "", "live": False, "fetchedAtMs": 0}
 
   if access_key == "":
     result["usageStatusText"] = "Waiting for auth"
@@ -297,18 +341,15 @@ def collect_limits(access_key: str, force: bool) -> dict[str, Any]:
 
   # A panel that is opened and shut repeatedly must not turn into a request
   # per flick, so recent probe results are reused for a short window — and
-  # kept as the answer of record when a later probe fails. The endpoint names
-  # no reset times, so a kept window stays as it was measured.
+  # kept as the answer of record when a later probe fails.
   cache = LimitsCache(AGENT_ID, access_key)
   cached_plan = str(cache.data.get("plan") or "")
-  cached_balance = cache.data.get("balance") if isinstance(cache.data.get("balance"), dict) else None
 
   # --force is a person asking for fresh numbers, so it skips the reuse window
   # entirely; the interval is there to absorb repeated panel opens, not to
-  # overrule someone who pressed refresh. A credit answer has no windows, and
-  # stands in all the same.
-  if cache.fresh(force, allow_empty=cache.data.get("credits") is True):
-    result.update(limits=cache.limits, balance=cached_balance, tierLabel=cached_plan, live=True, fetchedAtMs=cache.fetched_at)
+  # overrule someone who pressed refresh.
+  if cache.fresh(force, allow_empty=kept_balance(cache) is not None):
+    result.update(limits=cache.limits, tierLabel=cached_plan, live=True, fetchedAtMs=cache.fetched_at, balance=kept_balance(cache))
     return result
 
   probe = probe_limits(access_key)
@@ -317,10 +358,8 @@ def collect_limits(access_key: str, force: bool) -> dict[str, Any]:
     # A plan lookup that failed keeps the plan last named, rather than
     # blanking a label the account still has.
     plan = cached_plan if plan is None else plan
-    credits = "spent" in probe
-    balance = credit_balance(plan, probe.get("spent")) if credits else None
-    fetched_at = cache.save(probe["limits"], only_if_newer=True, plan=plan, credits=credits, balance=balance)
-    result.update(limits=probe["limits"], balance=balance, tierLabel=plan, live=True, fetchedAtMs=fetched_at)
+    fetched_at = cache.save(probe["limits"], only_if_newer=True, plan=plan, balance=probe["balance"])
+    result.update(limits=probe["limits"], tierLabel=plan, live=True, fetchedAtMs=fetched_at, balance=probe["balance"])
     return result
 
   # The first probe after login often fires before DHCP has handed out a
@@ -328,16 +367,13 @@ def collect_limits(access_key: str, force: bool) -> dict[str, Any]:
   if probe.get("transport"):
     result["retryAdvised"] = True
   result["authHelpText"] = probe["helpText"]
-  fallback, fetched_at = cache.kept()
-  # A kept credit answer stands with or without a balance, so Free keeps its plan.
-  kept_credits = not fallback and cache.data.get("credits") is True
-  if fallback:
-    result.update(limits=fallback, tierLabel=cached_plan, fetchedAtMs=fetched_at)
-  elif kept_credits:
-    result.update(balance=cached_balance, tierLabel=cached_plan, fetchedAtMs=cache.fetched_at)
+  fallback = cache.kept()[0]
+  balance = kept_balance(cache)
+  if fallback or balance:
+    result.update(limits=fallback, tierLabel=cached_plan, fetchedAtMs=cache.fetched_at, balance=balance)
   if probe.get("auth"):
     result["usageStatusText"] = "Sign-in expired"
-  elif not fallback and not kept_credits:
+  elif not fallback and not balance:
     result["usageStatusText"] = "Ollama limits unavailable"
   return result
 
@@ -370,10 +406,10 @@ def main() -> int:
       usageStatusText=limits["usageStatusText"],
       authHelpText=limits["authHelpText"],
       limits=limits["limits"],
-      limitsStale=bool(limits["limits"] or limits["balance"]) and not limits["live"],
+      limitsStale=bool(limits["limits"] or limits.get("balance")) and not limits["live"],
       limitsFetchedAt=limits["fetchedAtMs"],
     )
-    if limits["balance"]:
+    if limits.get("balance"):
       record["balance"] = limits["balance"]
     if limits.get("retryAdvised"):
       record["retryAdvised"] = True

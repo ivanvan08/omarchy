@@ -548,6 +548,47 @@ def oc_add(path: str | Path, message=(), session_message=(), forks=()) -> None:
   conn.close()
 
 
+# ------------------------------------------------------------ Claude Code
+
+
+def claude_code_session(name: str, replies: list, base_url: str | None = None) -> Path:
+  """A Claude Code transcript under ~/.claude/projects: a typed prompt and its
+  reply for each (model, input tokens) in `replies`, as Claude Code 2.1
+  writes them. `base_url` sets ANTHROPIC_BASE_URL in Claude Code's settings,
+  where pointing it at another provider is documented."""
+  stamp = fixture_now().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+  lines = []
+  for n, (model, tokens) in enumerate(replies):
+    lines.append({"type": "user", "uuid": f"{name}-prompt-{n}", "sessionId": name, "timestamp": stamp, "message": {"role": "user", "content": "go"}})
+    lines.append({"type": "assistant", "sessionId": name, "timestamp": stamp, "requestId": f"{name}-req-{n}",
+                  "message": {"id": f"{name}-msg-{n}", "role": "assistant", "model": model, "usage": {"input_tokens": tokens, "output_tokens": 0}}})
+  path = home() / ".claude" / "projects" / "project" / f"{name}.jsonl"
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+  if base_url is not None:
+    _merge(home() / ".claude" / "settings.json", "env", {"ANTHROPIC_BASE_URL": base_url})
+  return path
+
+
+def mcode_routed_session(name, provider, model, tokens, base_url=None):
+  """A MiniMax Code session with one prompt and its reply on `provider`, and,
+  for a `custom_provider:<id>`, that provider declared at `base_url` in
+  config.yaml, as `mcode provider add` writes it."""
+  root = home() / ".minimax"
+  session = root / "v2" / "sessions" / "2026" / "10" / "22" / name / "messages.jsonl"
+  session.parent.mkdir(parents=True, exist_ok=True)
+  session.write_text("".join(json.dumps(line) + "\n" for line in (
+    {"message": {"role": "user", "timestamp": ms_in(0), "content": "go"}},
+    {"message": {"role": "assistant", "timestamp": ms_in(0), "provider": provider, "model": model, "usage": {"input": tokens}}},
+  )))
+  if base_url is not None:
+    config = root / "config.yaml"
+    text = config.read_text() if config.exists() else "custom_provider:\n"
+    pid = provider.partition(":")[2]
+    config.write_text(text + f"  {pid}:\n    name: {pid}\n    kind: custom\n    options:\n      apiKey: sk-placeholder\n      baseURL: {base_url}\n")
+  return session
+
+
 # ------------------------------------------------------ credentials and state
 
 

@@ -37,9 +37,9 @@ def prompt(uuid, session, timestamp, subtype=None):
 
 
 # One billed answer, as Qwen Code logs it: a ui_telemetry api_response event.
-def response(uuid, session, timestamp, model, auth, input, output, cached, thoughts, response_id=""):
+def response(uuid, session, timestamp, model, auth, input, output, cached, thoughts, response_id="", total=0):
   event = {"event.name": "qwen-code.api_response", "event.timestamp": timestamp, "response_id": response_id, "model": model, "auth_type": auth,
-           "input_token_count": input, "output_token_count": output, "cached_content_token_count": cached, "thoughts_token_count": thoughts, "total_token_count": 0}
+           "input_token_count": input, "output_token_count": output, "cached_content_token_count": cached, "thoughts_token_count": thoughts, "total_token_count": total}
   return {"uuid": uuid, "sessionId": session, "timestamp": timestamp, "type": "system", "subtype": "ui_telemetry", "systemPayload": {"uiEvent": event}}
 
 
@@ -56,6 +56,11 @@ def chats(project="p"):
   return home() / ".qwen" / "projects" / project / "chats"
 
 
+# A machine that never ran Qwen Code has no local stats to show.
+sandbox()
+record = qwen()
+expect("Qwen with no usage says it has no local stats", [record["ready"], record["hasLocalStats"]], [False, False], record)
+
 # ------------------------------------------------------------- transcripts
 
 sandbox()
@@ -65,10 +70,12 @@ transcript(chats("-home-me-app") / "s1.jsonl", [
   prompt("u2", "s1", NOW, "mid_turn_user_message"),
   # Goal and notification records are not typed prompts.
   prompt("u3", "s1", NOW, "goal_runtime"),
-  # Gemini leaves thinking out of the output count.
-  response("r2", "s1", NOW, "gemini-2.5-pro", "gemini-api-key", 300, 40, 0, 10, "resp-2"),
   # A provider that reports only the cached part reported a fully cached prompt.
   response("r3", "s1", NOW, "qwen3-coder-plus", "openai", 0, 5, 80, 0, "resp-3"),
+  # Gemini's API is Google's, not a Qwen plan's, and so is the prompt it
+  # answers.
+  prompt("u5", "s1", NOW),
+  response("r2", "s1", NOW, "gemini-2.5-pro", "gemini", 300, 40, 0, 10, "resp-2"),
   {"uuid": "x", "type": "system", "subtype": "ui_telemetry", "systemPayload": {"uiEvent": {"event.name": "qwen-code.tool_call", "model": "m"}}},
   {"uuid": "y", "type": "assistant", "model": "qwen3-coder-plus", "usageMetadata": {"promptTokenCount": 999}},
 ])
@@ -86,13 +93,63 @@ expect("Qwen counts typed prompts and billed responses once each, booked on the 
   "two days ago": next(day["messageCount"] for day in record["recentDays"] if day["date"] == two_days_ago),
 }, {
   "name": "Qwen Code",
-  "counts": {"ready": True, "hasPromptStats": True, "todayPrompts": 2, "todaySessions": 1, "todayTotalTokens": 1635, "totalPrompts": 3, "totalSessions": 2, "activeDays": 2},
+  "counts": {"ready": True, "hasPromptStats": True, "todayPrompts": 2, "todaySessions": 1, "todayTotalTokens": 1285, "totalPrompts": 3, "totalSessions": 2, "activeDays": 2},
   "two days ago": 77,
 }, record)
 expect("Qwen reads tokens the way Qwen Code's own statistics do", record["modelUsage"], {
   "qwen3-coder-plus": {"inputTokens": 470, "outputTokens": 212, "cacheReadInputTokens": 680, "cacheCreationInputTokens": 0},
-  "gemini-2.5-pro": {"inputTokens": 300, "outputTokens": 50, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
 }, record)
+
+# Qwen Code 0.26.0's records through the Responses API, whose output_tokens
+# already include reasoning_tokens, with and without a total, and a record
+# kept without its auth type, with a total: thinking the total already holds
+# in the output counts once.
+sandbox()
+transcript(chats() / "r.jsonl", [
+  prompt("u1", "r", NOW),
+  response("r1", "r", NOW, "qwen-resp-model", "openai-responses", 5234, 55, 75, 5, "resp_mock5", total=5289),
+  response("r2", "r", NOW, "qwen-resp-model", "openai-responses", 6234, 56, 76, 5, "resp_mock6"),
+  response("r3", "r", NOW, "qwen3-coder-plus", "", 300, 40, 0, 10, "resp-g1", total=350),
+  response("r4", "r", NOW, "qwen3-coder-plus", "", 300, 40, 0, 10, "resp-g2", total=340),
+])
+record = qwen()
+expect("Qwen counts a Responses API reply's reasoning once, and other thinking only outside its total", {
+  model: usage["outputTokens"] for model, usage in record["modelUsage"].items()
+}, {"qwen-resp-model": 111, "qwen3-coder-plus": 90}, record)
+
+# ------------------------------------------------------------------ routes
+
+# A reply counts where it was billed. Qwen Code records only its auth type,
+# and settings.json's modelProviders the base URL each model is sent to:
+# Alibaba's hosts are Qwen's, OpenRouter's or a self-hosted server's are
+# theirs, and Anthropic's API, which Qwen Code reaches with --auth-type
+# anthropic, is no Qwen plan. Each prompt goes with the reply that answered
+# it. Shaped as Qwen Code 0.26.0 wrote them against a mock of each API.
+sandbox()
+write_json(home() / ".qwen" / "settings.json", {"modelProviders": {"openai": [
+  {"id": "qwen3-coder-plus", "baseUrl": "https://coding-intl.dashscope.aliyuncs.com/v1", "envKey": "BAILIAN_CODING_PLAN_API_KEY"},
+  {"id": "qwen/qwen3-coder", "baseUrl": "https://openrouter.ai/api/v1", "envKey": "OPENROUTER_API_KEY"},
+  {"id": "local-qwen", "baseUrl": "http://127.0.0.1:18083/v1"},
+]}})
+transcript(chats() / "routes.jsonl", [
+  prompt("u1", "routes", NOW),
+  response("r1", "routes", NOW, "qwen3-coder-plus", "openai", 1234, 51, 71, 5, "chatcmpl-mock1", total=1285),
+  prompt("u2", "routes", NOW),
+  response("r2", "routes", NOW, "claude-mock-model", "anthropic", 7234, 57, 77, 0, "msg_mock7", total=7291),
+  prompt("u3", "routes", NOW),
+  response("r3", "routes", NOW, "qwen/qwen3-coder", "openai", 5000, 50, 0, 0, "chatcmpl-or"),
+  prompt("u4", "routes", NOW),
+  response("r4", "routes", NOW, "local-qwen", "openai", 3000, 30, 0, 0, "chatcmpl-local"),
+  prompt("u5", "routes", NOW),
+  response("r5", "routes", NOW, "qwen-unlisted", "openai", 100, 10, 0, 0, "chatcmpl-default"),
+])
+record = qwen()
+expect("Qwen counts the replies Alibaba billed or nothing places, with their prompts, and leaves other providers' out",
+       [sorted(record["modelUsage"]), record["todayPrompts"], record["todayTotalTokens"]],
+       [["qwen-unlisted", "qwen3-coder-plus"], 2, 1285 + 110], record)
+local = collect("local", "--force")
+expect("Local counts the Qwen Code replies sent to a self-hosted server",
+       [local["todayTokensByModel"], local["todayPrompts"]], [{"local-qwen": 3030}, 1], local)
 
 # --------------------------------------------------------- untrusted fields
 
@@ -103,11 +160,15 @@ transcript(chats() / "s.jsonl", [
   response("bad3", "s", NOW, "m", "openai", "100", True, float("nan"), -5, "a"),
   response("bad4", "s", NOW, "m", "openai", 1e30, 0, 0, 0, "b"),
   response("ok1", "s", NOW, "m", "openai", 10, 2, 0, 0, "c"),
+  prompt("bad5", "s", "\u00b2"),
+  # A line nested deeper than the parser will go.
+  "[" * 100000 + '"user"',
 ])
 with (chats() / "s.jsonl").open("a") as torn:
   torn.write('{"uuid":"z","type":"user","timestamp":')
 record = qwen()
-expect("Qwen skips bad times, bad token fields, and a torn last line", [record["todayPrompts"], record["todayTotalTokens"]], [0, 12], record)
+expect("Qwen skips bad times, bad token fields, a line nested too deep, and a torn last line",
+       [record["todayPrompts"], record["todayTotalTokens"]], [0, 12], record)
 
 # A record with no time is dated once, by the transcript's time as it is
 # read, so it isn't today's again on every day after.
@@ -135,6 +196,11 @@ write_json(home() / ".qwen" / "settings.json", {"advanced": {"runtimeOutputDir":
 transcript(home() / "out" / "projects" / "p" / "chats" / "s.jsonl", [response("d", "s", NOW, "m", "openai", 1000, 0, 0, 0, "rd")])
 record = qwen()
 expect("Qwen reads the runtimeOutputDir from settings.json", record["todayTotalTokens"], 1100, record)
+
+# A runtimeOutputDir no path can name is no place to look.
+write_json(home() / ".qwen" / "settings.json", {"advanced": {"runtimeOutputDir": "/\u0000x"}})
+record = qwen()
+expect("Qwen ignores a runtimeOutputDir holding a NUL", record["todayTotalTokens"], 100, record)
 
 # ------------------------------------------------- Qwen plans in pi and opencode
 

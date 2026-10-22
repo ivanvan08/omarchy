@@ -160,7 +160,14 @@ with contextlib.redirect_stderr(io.StringIO()):
   record = devin()
 expect("Devin survives an unreadable session database and doesn't cache that scan",
        [record["id"], record["todayTotalTokens"], scan_cache_files("devin")], ["devin", 0, []], record)
+expect("an unreadable session database says Devin is unavailable rather than hiding it",
+       [record["ready"], record["usageStatusText"], str(cli_dir() / "sessions.db") in record["authHelpText"]], [True, "Devin unavailable", True], record)
 (cli_dir() / "sessions.db").write_bytes(good)
+(cli_dir() / "sessions.db").chmod(0)
+with contextlib.redirect_stderr(io.StringIO()):
+  record = devin()
+(cli_dir() / "sessions.db").chmod(0o644)
+expect("a session database it may not open says Devin is unavailable", [record["ready"], record["usageStatusText"]], [True, "Devin unavailable"], record)
 
 # ------------------------------------------------------- the older layout
 
@@ -284,6 +291,13 @@ expect("Devin honors hidden windows, credit buckets and tier names",
 
 write_status("a", now, plan="Pro", hideWeekly=1, daily=10, weekly=80, dailyReset=now + 3600, weeklyReset=now + 86400)
 expect("Devin honors a hidden weekly window", windows(devin()), [["Daily", 0.9]])
+
+# TeamsTier, as the Devin protocol numbers it, has 8 and 11 too.
+names = []
+for tier in (8, 11):
+  write_status("a", now, tier=tier, daily=10, weekly=80, dailyReset=now + 3600, weeklyReset=now + 86400)
+  names.append(devin()["tierLabel"])
+expect("Devin names every tier the protocol numbers", names, ["Pro Ultimate", "Enterprise Saas Pooled"])
 
 # A fetch stamped ahead of the clock (one that went back) isn't current.
 write_status("a", now + 3600, plan="Pro", daily=10, weekly=80, dailyReset=now + 7200, weeklyReset=now + 86400)

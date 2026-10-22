@@ -13,8 +13,9 @@ session counts, per-day and per-model breakdowns. Sources (all local):
   - opencode sessions with providerID == "meta" (any Muse Spark model).
     Muse Spark served through OpenCode Zen (providerID == "opencode") is
     Zen usage, and the opencode record counts it.
-  - pi/omp sessions on the `meta` provider, in every session root (profiles
-    and PI_CODING_AGENT_DIR included).
+  - pi/omp sessions on the `meta` provider, or omp's `muse-code` (its Muse
+    Code sign-in), in every session root (profiles and PI_CODING_AGENT_DIR
+    included).
 
 Subscription windows (additive, authoritative only): when the CLI is signed
 in via `muse login`, the collector probes the client's own key endpoint
@@ -89,7 +90,8 @@ MAX_SESSION_BYTES = 512 * 1024 * 1024
 # are rescanned instead of trusted. 3: prompts and sessions from the session
 # index. 4: pi/omp sessions counted. 5: native sessions the index hasn't seen
 # counted. 6: today's prompts from what each session's count grew by today.
-CACHE_SCHEMA_VERSION = 6
+# 7: a child's calls known only from the session's usage attribution.
+CACHE_SCHEMA_VERSION = 7
 
 
 def key_endpoint() -> str:
@@ -309,6 +311,35 @@ def iter_native_events(path):
         yield payload, event.get("recorded_at"), event.get("id")
 
 
+# A session's log credits every billed run to its owner in a
+# goal_usage_attribution record: the main agent, and each child it ran, such
+# as the reminder agents that watch a prompt. Most children keep a log of
+# their own, whose completions are counted from it, but some (a skill
+# reminder among them) leave nothing but this record, the only trace of the
+# calls they made. Returns (input, output, cache read, cache write) for such a
+# child's record, once per usage id, and None for every other.
+def attributed_usage(record, logged, seen):
+  if not isinstance(record, dict):
+    return None
+  owner = record.get("owner") if isinstance(record.get("owner"), dict) else {}
+  quantity = record.get("quantity") if isinstance(record.get("quantity"), dict) else {}
+  owner_id = owner.get("owner_id")
+  usage_id = record.get("usage_id")
+  if not isinstance(owner_id, str) or owner.get("owner_type") == "main_root" or owner_id in logged:
+    return None
+  if quantity.get("unit") != "tokens" or quantity.get("reported") is False:
+    return None
+  if not isinstance(usage_id, str) or not usage_id or usage_id in seen:
+    return None
+  input_tokens = token_count(quantity.get("input_tokens"))
+  cache_read = min(input_tokens, token_count(quantity.get("cached_tokens")))
+  output_tokens = token_count(quantity.get("output_tokens"))
+  if not (input_tokens or output_tokens):
+    return None
+  seen.add(usage_id)
+  return input_tokens - cache_read, output_tokens, cache_read, 0
+
+
 def scan_native_muse_sessions(stats, indexed=frozenset()):
   """Add native Muse session completions. Returns whether every session file
   was read (safe to cache); a deliberately skipped one doesn't count."""
@@ -334,6 +365,10 @@ def scan_native_muse_sessions(stats, indexed=frozenset()):
     return False
   complete = True
   seen_event_ids = set()
+  # Every agent with a log of its own: a session and each subagent are named
+  # by their ids, so a child attributed usage without one is found here.
+  logged = {p.parent.name for p in files}
+  seen_usage_ids = set()
   for path in files:
     try:
       # Fail closed on entries that could escape the sessions tree or stall
@@ -352,6 +387,13 @@ def scan_native_muse_sessions(stats, indexed=frozenset()):
     except OSError:
       complete = False
       continue
+    # Session directories are named by the index's session id, and subagent
+    # trees roll up into their parent session: normalize both the main
+    # session.jsonl and any subagent/.../session.jsonl to the session
+    # directory, so one user session counts once however many subagents it
+    # spawned.
+    session_dir = re.sub(r"(/subagent/.*)?/session\.jsonl$", "", str(path))
+    counted = Path(session_dir).name not in indexed
     current_model = ""
     try:
       for payload, recorded_at, event_id in iter_native_events(path):
@@ -373,6 +415,14 @@ def scan_native_muse_sessions(stats, indexed=frozenset()):
           continue
         event = payload.get("event") or {}
         if not isinstance(event, dict):
+          continue
+        if event.get("kind") == "goal_usage_attribution":
+          attributed = attributed_usage(event.get("record"), logged, seen_usage_ids)
+          model = model_name(current_model) if current_model is not None else None
+          if attributed and model:
+            # A child's calls, on the session's model, answer no prompt.
+            stats.add(local_day(recorded_at) or mtime_day, "muse:" + session_dir if counted else None, model,
+                      *attributed, prompts=0)
           continue
         if event.get("kind") != "model_completed":
           continue
@@ -407,18 +457,12 @@ def scan_native_muse_sessions(stats, indexed=frozenset()):
           seen_event_ids.add(event_id)
         # An unusable stamp falls back on the file's own time.
         day = local_day(recorded_at) or mtime_day
-        # Subagent trees roll up into their parent session: normalize both the
-        # main session.jsonl and any subagent/.../session.jsonl to the session
-        # directory, so one user session counts once however many subagents
-        # it spawned.
-        session_dir = re.sub(r"(/subagent/.*)?/session\.jsonl$", "", str(path))
-        # The session directory is named by the index's session id. One the
-        # index has no row for yet counts its completions as prompts, as it
-        # would with no index at all. One it has a row for supplied its real
-        # prompt and session counts already: its tokens still count, but a
-        # completion is a model call, not a prompt, and its session is the
-        # index's. An undated completion counts in the totals only.
-        counted = Path(session_dir).name not in indexed
+        # A session the index has no row for yet counts its completions as
+        # prompts, as it would with no index at all. One it has a row for
+        # supplied its real prompt and session counts already: its tokens
+        # still count, but a completion is a model call, not a prompt, and its
+        # session is the index's. An undated completion counts in the totals
+        # only.
         stats.add(day, "muse:" + session_dir if counted else None, model,
                   input_tokens, output_tokens, cache_read, cache_write, prompts=1 if counted else 0)
     except OSError:
@@ -430,18 +474,22 @@ def scan_native_muse_sessions(stats, indexed=frozenset()):
 
 # pi, omp, and opencode alike: the meta provider is Meta's own Muse Spark API
 # and only serves Muse Spark models, so any model on it counts (muse-spark
-# 1.1/1.2/1.3, ...). Muse Spark through the Zen gateway (providerID
-# "opencode") is OpenCode usage, so the opencode record keeps it.
+# 1.1/1.2/1.3, ...), and so does omp's `muse-code`, the same API reached
+# through a Muse Code sign-in. Muse Spark through the Zen gateway
+# (providerID "opencode") is OpenCode usage, so the opencode record keeps it.
+PROVIDERS = ("meta", "muse-code")
+
+
 def billed_here(provider, model, entry):
-  return provider == "meta"
+  return provider in PROVIDERS
 
 
 def scan_shared_stores(stats):
-  """pi/omp and opencode replies on the meta provider. Returns whether every
+  """pi/omp and opencode replies on Meta's providers. Returns whether every
   source was read in full (safe to cache)."""
-  pi_rows, pi_complete = scan_pi_sessions(r'"provider"\s*:\s*"meta"', billed_here)
+  pi_rows, pi_complete = scan_pi_sessions(r'"provider"\s*:\s*"(' + "|".join(PROVIDERS) + r')"', billed_here)
   # The closing quote makes the database's prefilter match the whole id.
-  db_rows, db_complete = scan_opencode(['meta"'], billed_here)
+  db_rows, db_complete = scan_opencode([provider + '"' for provider in PROVIDERS], billed_here)
   for row in db_rows + pi_rows:
     model = model_name(row.model)
     if model is not None:
@@ -490,7 +538,12 @@ def normalize_reset_at(value) -> str:
   try:
     ts = float(value)
   except Exception:
-    return ""
+    # Some answers give the reset as an ISO time, which omp reads too.
+    try:
+      parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+      return ""
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).isoformat()
   if ts <= 0:
     return ""
   # Epoch seconds; accept milliseconds too.

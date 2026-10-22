@@ -30,6 +30,11 @@ def sessions():
   return home() / ".pi" / "agent" / "sessions"
 
 
+# A machine that never used DeepSeek has no local stats to show.
+sandbox()
+record = deepseek()
+expect("DeepSeek with no usage says it has no local stats", [record["ready"], record["hasLocalStats"]], [False, False], record)
+
 # ------------------------------------------------- pi, omp and opencode
 
 # Only the deepseek provider counts, from pi, omp and opencode alike, with
@@ -86,6 +91,12 @@ def header(session, seeded=False):
   return {"type": "session", "version": 4, "id": session, "createdAt": now, "isSeeded": seeded, "delegationDepth": 0}
 
 
+# A message someone typed, as dsh logs it before the turn's first request;
+# dsh's own turns (a schedule, a goal round) carry another source.
+def typed(seq=1, kind="user"):
+  return {"type": "user/message", "seq": seq, "time": now, "data": {"content": [{"type": "text", "text": "go"}], "source": {"kind": kind}, "role": "user", "id": f"m{seq}"}}
+
+
 def route(provider, model, seq=1):
   return {"type": "request/header", "seq": seq, "time": now, "data": {"header": {"config": {"provider": provider, "model": model}}, "reason": "initial"}}
 
@@ -120,6 +131,7 @@ project = home() / "dsh" / "sessions" / "--home-me-code--"
 # count; a retry of step 2 adds a second billed attempt.
 write_log(project / "s1" / ("session.v4" + suffix), [
   header("s1"),
+  typed(),
   route("deepseek-official", "deepseek-v4-pro"),
   message(1, 1, usage(1, 1), kind="assistant/attempt"),
   message(1, 1, usage(100, 10, 20, 0)),
@@ -135,20 +147,22 @@ write_log(project / "s2" / ("session.v4" + suffix), [header("s2"), route("pi-ai:
 # follows its seed marker was spent in it.
 write_log(project / "s3" / ("session.v4" + suffix), [
   header("s3", seeded=True),
+  typed(),
   route("deepseek-official", "deepseek-v4-pro"),
   message(1, 1, usage(100, 10, 20, 0)),
   {"type": "session/end-seed", "seq": 4, "time": now, "data": {"inherited": True}},
+  typed(seq=5),
   route("deepseek-account", "deepseek-v4-flash", seq=5),
   message(2, 1, usage(4000, 6, 0, 1)),
 ], compressed)
 # A root written with compression off reads the same, torn tail and all.
-write_log(project / "s4" / "session.v4.jsonl", [header("s4"), route("deepseek-official", "deepseek-chat"), message(1, 1, usage(30000))], False,
+write_log(project / "s4" / "session.v4.jsonl", [header("s4"), typed(), route("deepseek-official", "deepseek-chat"), message(1, 1, usage(30000))], False,
           torn=b'{"type":"assistant/mess')
 
 record = deepseek()
 expect("DeepSeek counts DeepSeek Harness sessions on its DeepSeek routes",
        {key: record[key] for key in ("todayTotalTokens", "totalPrompts", "totalSessions", "modelUsage")}, {
-  "todayTotalTokens": 34153, "totalPrompts": 5, "totalSessions": 3, "modelUsage": {
+  "todayTotalTokens": 34153, "totalPrompts": 3, "totalSessions": 3, "modelUsage": {
     "deepseek-v4-pro": {"inputTokens": 112, "outputTokens": 14, "cacheReadInputTokens": 20, "cacheCreationInputTokens": 0},
     "deepseek-v4-flash": {"inputTokens": 4000, "outputTokens": 6, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 1},
     "deepseek-chat": {"inputTokens": 30000, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
@@ -170,6 +184,51 @@ expect("DeepSeek skips a dsh line nested too deep to parse, keeping the rest of 
 shutil.rmtree(project / "s5")
 shutil.rmtree(project / "s6")
 
+# dsh's pi-ai adapter names a route by its pi-ai provider id, as dsh 0.2 logs
+# it: pi-ai's `deepseek` provider is DeepSeek's API, and `openrouter` (or a
+# hand-declared gateway) is billed by whoever runs it.
+write_log(project / "s9" / ("session.v4" + suffix), [
+  header("s9"),
+  route("deepseek", "deepseek-chat"),
+  message(1, 1, {"inputTokens": 5234, "outputTokens": 55, "cacheReadTokens": 75, "totalTokens": 5364}),
+  route("openrouter", "z-ai/glm-4.6", seq=3),
+  message(2, 1, {"inputTokens": 7000, "outputTokens": 68, "cacheReadTokens": 300, "totalTokens": 7368}, seq=4),
+], compressed)
+record = deepseek()
+expect("DeepSeek counts dsh's pi-ai deepseek route, not its other pi-ai routes",
+       [record["todayTotalTokens"], record["modelUsage"].get("deepseek-chat", {}).get("inputTokens"), "z-ai/glm-4.6" in record["modelUsage"]],
+       [34153 + 5364, 30000 + 5234, False], record)
+shutil.rmtree(project / "s9")
+
+# A prompt is a typed message, not a billed step: dsh 0.2.1's headless run
+# of one typed prompt that read a file took three steps, the same session
+# resumed with --session-id took one more typed turn, and a turn dsh started
+# on its own schedule answers no one.
+write_log(project / "s10" / ("session.v4" + suffix), [
+  header("s10"),
+  {"type": "agent/inbox/spliced", "seq": 1, "time": now, "data": {"target": "next-turn", "start": 0, "inserted": [{"source": {"kind": "user"}, "role": "user", "id": "m2"}]}},
+  {"type": "turn/start", "seq": 2, "time": now, "data": {"turn": 1}},
+  typed(seq=3),
+  {"type": "user/message", "seq": 4, "time": now, "data": {"source": {"kind": "runtime-context", "form": "snapshot"}, "role": "user", "id": "m4"}},
+  route("deepseek-official", "deepseek-flash", seq=5),
+  message(1, 1, usage(12417), seq=6),
+  message(1, 2, usage(14423), seq=7),
+  message(1, 3, usage(15426), seq=8),
+  {"type": "session/end-seed", "seq": 9, "time": now, "data": {}},
+  {"type": "turn/start", "seq": 10, "time": now, "data": {"turn": 2}},
+  typed(seq=11),
+  route("deepseek-official", "deepseek-flash", seq=12),
+  message(2, 1, usage(16429), seq=13),
+  {"type": "turn/start", "seq": 14, "time": now, "data": {"turn": 3}},
+  typed(seq=15, kind="schedule"),
+  route("deepseek-official", "deepseek-flash", seq=16),
+  message(3, 1, usage(1000), seq=17),
+], compressed)
+record = deepseek()
+expect("DeepSeek counts a dsh prompt per typed message, not per step or scheduled turn",
+       [record["totalPrompts"], record["modelUsage"].get("deepseek-flash", {}).get("inputTokens")], [3 + 2, 12417 + 14423 + 15426 + 16429 + 1000], record)
+shutil.rmtree(project / "s10")
+
 # A frame that inflates past the cap (64 MiB, far beyond any real log) is
 # never read in full: the log counts nothing, and the scan, incomplete, isn't
 # kept for the next run.
@@ -188,6 +247,26 @@ if compressed:
 else:
   print("ok - DeepSeek stops a dsh log that inflates past its cap # SKIP no Zstandard support")
 
+# A session directory the walk can't list has logs the scan missed, so the
+# scan isn't kept: once it's readable again, the next plain run counts it.
+if os.geteuid() != 0:
+  locked = project / "s8"
+  write_log(locked / "session.v4.jsonl", [header("s8"), route("deepseek-official", "deepseek-locked"), message(1, 1, usage(80))], False)
+  for path in scan_cache_files("deepseek"):
+    path.unlink()
+  locked.chmod(0)
+  try:
+    record = deepseek()
+  finally:
+    locked.chmod(0o755)
+  expect("DeepSeek doesn't cache a dsh scan that couldn't list every session directory",
+         ["deepseek-locked" in record["modelUsage"], scan_cache_files("deepseek")], [False, []], record)
+  record = deepseek("--limits-only")
+  expect("DeepSeek counts the dsh session once its directory is readable again", record["modelUsage"].get("deepseek-locked", {}).get("inputTokens"), 80, record)
+  shutil.rmtree(locked)
+else:
+  print("ok - DeepSeek doesn't cache a dsh scan that couldn't list every session directory # SKIP root reads anything")
+
 # dsh keeps its key in its managed .credentials.yaml, or a .env beside it.
 (home() / "dsh" / ".credentials.yaml").write_text("""# managed by dsh
 version: 1
@@ -201,6 +280,18 @@ first = collector.api_key()
 (home() / "dsh" / ".env").write_text("export DEEPSEEK_API_KEY='sk-from-env-file'\n")
 expect("DeepSeek reads the key dsh stores, from its credentials or its .env", [first, collector.api_key()], ["sk-from-dsh", "sk-from-env-file"])
 del os.environ["DSH_HOME"]
+
+# Claude Code pointed at DeepSeek's Anthropic API is DeepSeek's; with no
+# endpoint, only a DeepSeek model's reply is.
+sandbox()
+claude_code_session("ds", [("deepseek-chat", 300), ("claude-sonnet-4-5", 40)])
+record = deepseek()
+expect("DeepSeek counts Claude Code's DeepSeek replies, and no Claude one",
+       [record["todayTokensByModel"], record["todayPrompts"], record["todaySessions"]], [{"deepseek-chat": 300}, 1, 1], record)
+claude_code_session("ds", [("deepseek-chat", 300), ("claude-sonnet-4-5", 40)], base_url="https://api.deepseek.com/anthropic")
+record = deepseek()
+expect("DeepSeek counts every Claude Code reply while Claude Code is pointed at DeepSeek",
+       [record["todayTokensByModel"], record["todayPrompts"]], [{"deepseek-chat": 300, "claude-sonnet-4-5": 40}, 2], record)
 
 # ---------------------------------------------------------------- contract
 

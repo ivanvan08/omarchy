@@ -17,7 +17,6 @@ reads the JSON this prints.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import sys
@@ -37,15 +36,17 @@ from collectors import (  # noqa: E402
   cached_scan,
   data_home,
   emit,
-  local_day,
   open_json,
   opencode_db,
   pi_session_roots,
   read_json,
+  routed_match,
+  routed_sources,
   scan_max_age,
   scan_opencode,
   scan_pi_sessions,
-  token_count,
+  scan_routed,
+  trusted_endpoint,
   warn,
 )
 
@@ -126,18 +127,17 @@ def config_key(config: dict[str, Any]) -> str:
 
 
 def config_base_url(config: dict[str, Any]) -> str:
+  """The host mmx itself asks: its base_url, then the OAuth session's
+  resource_url, then the region (MINIMAX_REGION over the saved one)."""
   oauth = config.get("oauth")
-  if isinstance(oauth, dict):
-    resource_url = oauth.get("resource_url")
-    if isinstance(resource_url, str) and resource_url.strip():
-      return resource_url.strip()
-    if oauth.get("region") == "cn":
-      return CN_BASE_URL
-  value = config.get("base_url")
-  if isinstance(value, str) and value.strip():
-    return value.strip()
-  if config.get("region") == "cn" or os.environ.get("MINIMAX_REGION") == "cn":
-    return CN_BASE_URL
+  oauth = oauth if isinstance(oauth, dict) else {}
+  for value in (config.get("base_url"), oauth.get("resource_url")):
+    if isinstance(value, str) and value.strip():
+      return value.strip()
+  # mmx refuses a region it doesn't know; here one just doesn't decide.
+  for region in (os.environ.get("MINIMAX_REGION"), config.get("region"), oauth.get("region")):
+    if region in ("cn", "global"):
+      return CN_BASE_URL if region == "cn" else DEFAULT_BASE_URL
   return DEFAULT_BASE_URL
 
 
@@ -222,14 +222,40 @@ def is_media_row(row: dict[str, Any]) -> bool:
   return any(word in name for word in MEDIA_MODEL_WORDS)
 
 
+# current_*_status per window: 1 normal, 2 exhausted, 3 unlimited.
+STATUS_EXHAUSTED = 2
+STATUS_UNLIMITED = 3
+
+
+def not_in_plan(row: dict[str, Any]) -> bool:
+  """The shape mmx shows as "not in plan": both windows unlimited with
+  nothing allotted, a model the plan doesn't cover rather than a full one."""
+  return (
+    number(row.get("current_interval_total_count")) == 0 and number(row.get("current_weekly_total_count")) == 0
+    and number(row.get("current_interval_status")) == STATUS_UNLIMITED and number(row.get("current_weekly_status")) == STATUS_UNLIMITED
+  )
+
+
+def window_used(row: dict[str, Any], percent_key: str, status_key: str) -> float | None:
+  status = number(row.get(status_key))
+  # MiniMax's own status outranks the percentage: an exhausted window may
+  # omit it or keep a stale one, and an unlimited one has nothing to fill.
+  if status == STATUS_EXHAUSTED:
+    return 1.0
+  if status == STATUS_UNLIMITED:
+    return None
+  return used_fraction(row.get(percent_key))
+
+
 def quota_limits(payload: dict[str, Any]) -> list[dict[str, Any]]:
   rows = payload.get("model_remains")
   if not isinstance(rows, list):
     raise MiniMaxError("MiniMax returned no Token Plan quotas")
 
   # "general" is the language/agent quota. Without it the first row that
-  # isn't a media model's stands for the plan.
-  rows = [row for row in rows if isinstance(row, dict)]
+  # isn't a media model's stands for the plan. A model outside the plan is
+  # never it.
+  rows = [row for row in rows if isinstance(row, dict) and not not_in_plan(row)]
   general = next((row for row in rows if row.get("model_name") == "general"), None)
   if general is None:
     general = next((row for row in rows if not is_media_row(row)), None)
@@ -237,8 +263,8 @@ def quota_limits(payload: dict[str, Any]) -> list[dict[str, Any]]:
     raise MiniMaxError("MiniMax returned no usable Token Plan quota")
 
   limits = []
-  interval = used_fraction(general.get("current_interval_remaining_percent"))
-  weekly = used_fraction(general.get("current_weekly_remaining_percent"))
+  interval = window_used(general, "current_interval_remaining_percent", "current_interval_status")
+  weekly = window_used(general, "current_weekly_remaining_percent", "current_weekly_status")
   if interval is not None:
     limits.append({
       "label": "Session (5-hour)",
@@ -258,6 +284,10 @@ def quota_limits(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 def fetch_quota(api_key: str, base_url: str) -> dict[str, Any]:
   endpoint = base_url.rstrip("/") + "/v1/token_plan/remains"
+  # MINIMAX_BASE_URL, --base-url and mmx's own base_url or resource_url move
+  # the endpoint, never the key onto a connection anyone on the way can read.
+  if not trusted_endpoint(endpoint):
+    raise MiniMaxError("The MiniMax endpoint must use HTTPS (plain HTTP only for loopback); the key was not sent.")
   request = urllib.request.Request(
     endpoint,
     headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -345,77 +375,6 @@ def collect_limits(api_key: str, base_url: str, force: bool) -> dict[str, Any]:
 # Local session stats
 # --------------------------------------------------------------------------
 
-def pi_style_tokens(usage: dict[str, Any]) -> tuple[int, int, int, int]:
-  inp = token_count(usage.get("input"))
-  out = token_count(usage.get("output"))
-  cread = token_count(usage.get("cacheRead"))
-  cwrite = token_count(usage.get("cacheWrite"))
-  if not (inp or out):
-    # Only a total: MiniMax's input excludes the cache tokens, which keep
-    # their own buckets.
-    inp = max(0, token_count(usage.get("totalTokens")) - cread - cwrite)
-  return inp, out, cread, cwrite
-
-
-def mcode_day(message: dict[str, Any], entry: dict[str, Any]) -> str | None:
-  """The day of a MiniMax Code line: the message's time, else the line's.
-  A line with neither, or with neither trusted, is skipped."""
-  for value in (message.get("timestamp"), entry.get("timestamp")):
-    if value is not None and (day := local_day(value)):
-      return day
-  return None
-
-
-def mcode_data_dir() -> Path:
-  for name in ("MINIMAX_DATA_DIR", "MAVIS_DATA_DIR"):
-    value = os.environ.get(name, "").strip()
-    if value:
-      return Path(os.path.abspath(os.path.expanduser(value)))
-  return Path.home() / ".minimax"
-
-
-def scan_mcode(stats: Stats) -> bool:
-  """Add MiniMax Code's own sessions: user messages are prompts, assistant usage is tokens."""
-  root = mcode_data_dir() / "v2" / "sessions"
-  if not root.is_dir():
-    return True
-  complete = True
-  for path in sorted(root.rglob("messages.jsonl")):
-    # One directory per session; its messages carry no session id of their own.
-    session = "mcode:" + str(path.parent)
-    try:
-      with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for raw in handle:
-          try:
-            entry = json.loads(raw)
-          except Exception:
-            # A line nested too deep to parse is a RecursionError, not a
-            # ValueError; either way only that line is lost.
-            continue
-          message = entry.get("message") if isinstance(entry, dict) else None
-          if not isinstance(message, dict):
-            continue
-          day = mcode_day(message, entry)
-          if day is None:
-            continue
-          # MiniMax Code books a typed prompt and the assistant's usage on
-          # lines of their own.
-          if message.get("role") == "user":
-            stats.add_prompts(day, session)
-            continue
-          usage = message.get("usage")
-          if message.get("role") != "assistant" or not isinstance(usage, dict):
-            continue
-          inp, out, cread, cwrite = pi_style_tokens(usage)
-          if not (inp or out or cread or cwrite):
-            continue
-          model = str(message.get("model") or entry.get("model") or "minimax").strip() or "minimax"
-          stats.add(day, session, model, inp, out, cread, cwrite, prompts=0)
-    except OSError:
-      complete = False
-  return complete
-
-
 # pi, omp, and opencode name the provider alike. Exact names: a custom
 # gateway in front of MiniMax is not this account.
 def billed_here(provider: str, model: str, entry: dict) -> bool:
@@ -425,7 +384,11 @@ def billed_here(provider: str, model: str, entry: dict) -> bool:
 def scan_sessions() -> tuple[dict[str, Any], bool]:
   stats = Stats()
   # Every source runs, so one unreadable source still leaves the others.
-  mcode_complete = scan_mcode(stats)
+  # MiniMax Code on MiniMax's own routes or a custom provider at MiniMax's
+  # host, and Claude Code pointed at MiniMax or answered by a MiniMax model.
+  routed_rows, routed_complete = scan_routed(AGENT_ID)
+  for row in routed_rows:
+    stats.add_row(row, row.model or "minimax")
   pattern = r'"provider"\s*:\s*"(' + "|".join(PROVIDERS) + r')"'
   pi_rows, pi_complete = scan_pi_sessions(pattern, billed_here)
   for row in pi_rows:
@@ -435,12 +398,13 @@ def scan_sessions() -> tuple[dict[str, Any], bool]:
   db_rows, db_complete = scan_opencode(["minimax"], billed_here)
   for row in db_rows:
     stats.add_row(row, row.model.rstrip("/").split("/")[-1] or "minimax")
-  return stats.snapshot(), mcode_complete and pi_complete and db_complete
+  return stats.snapshot(), routed_complete and pi_complete and db_complete
 
 
 def cached_local_stats(max_age_seconds: float) -> dict[str, Any]:
   # The digest covers every data path the scan reads.
-  return cached_scan(AGENT_ID, [mcode_data_dir(), opencode_db(), *pi_session_roots()], max_age_seconds, scan_sessions)
+  sources = [opencode_db(), *pi_session_roots(), *routed_sources()]
+  return cached_scan(AGENT_ID, sources, max_age_seconds, scan_sessions, match=routed_match())
 
 
 # --------------------------------------------------------------------------

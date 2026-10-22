@@ -106,6 +106,19 @@ record, _ = minimax({"model_remains": [
 ]})
 expect("MiniMax collector skips media quota rows when choosing the plan's row", [entry["percent"] for entry in record["limits"]], [0.75], record)
 
+# Each window's status outranks its percentage, as in mmx and omp: 2 is
+# exhausted however much the stale percentage says remains, 3 is unlimited,
+# with nothing to fill. A row in mmx's "not in plan" shape (both windows
+# unlimited, nothing allotted) is never the plan's row.
+record, _ = minimax({"model_remains": [
+  {"model_name": "general", "current_interval_total_count": 0, "current_interval_remaining_percent": 100, "current_interval_status": 3,
+   "current_weekly_total_count": 0, "current_weekly_remaining_percent": 100, "current_weekly_status": 3},
+  {"model_name": "MiniMax-M2", "current_interval_total_count": 1500, "current_interval_remaining_percent": 40, "current_interval_status": 2,
+   "current_weekly_total_count": 0, "current_weekly_remaining_percent": 100, "current_weekly_status": 3},
+], "base_resp": {"status_code": 0, "status_msg": "success"}})
+expect("MiniMax reads an exhausted window as spent, drops an unlimited one, and skips a model outside the plan",
+       [(entry["label"], entry["percent"]) for entry in record["limits"]], [("Session (5-hour)", 1.0)], record)
+
 # The bearer never follows a redirect to another host.
 elsewhere, stolen = stub_server(lambda request: {"model_remains": []})
 origin, _ = stub_server(lambda request: (302, b"", {"Location": elsewhere + "/steal"}))
@@ -132,6 +145,15 @@ expect("MiniMax credentials use the key mmx saved", credentials(), ["mmx_saved",
 write_json(home() / ".mmx" / "config.json", {"oauth": {"access_token": "mmx_oauth", "refresh_token": "refresh", "expires_at": "2099-01-01T00:00:00Z", "region": "cn"}})
 expect("MiniMax credentials use the OAuth session and region saved by mmx", credentials(), ["mmx_oauth", "https://api.minimaxi.com"])
 
+# mmx 1.0's own order: base_url, then the OAuth resource_url, then the region,
+# with MINIMAX_REGION over the saved one.
+write_json(home() / ".mmx" / "config.json", {"base_url": "https://mmx.example", "oauth": {"access_token": "mmx_oauth", "resource_url": "https://resource.example"}})
+expect("MiniMax asks mmx's base_url ahead of its OAuth resource_url", credentials(), ["mmx_oauth", "https://mmx.example"])
+write_json(home() / ".mmx" / "config.json", {"api_key": "mmx_saved", "region": "cn"})
+os.environ["MINIMAX_REGION"] = "global"
+expect("MiniMax lets MINIMAX_REGION move mmx's key off the region mmx saved", credentials(), ["mmx_saved", "https://api.minimax.io"])
+del os.environ["MINIMAX_REGION"]
+
 (home() / ".mmx" / "config.json").unlink()
 opencode = opencode_auth(None, "minimax", "mmx_opencode")
 expect("MiniMax credentials use opencode's login", credentials()[0], "mmx_opencode")
@@ -155,6 +177,20 @@ os.environ["MINIMAX_BASE_URL"] = "https://minimax.example"
 expect("MiniMax asks MINIMAX_BASE_URL when it is set", credentials(), ["mmx_env", "https://minimax.example"])
 del os.environ["MINIMAX_API_KEY"], os.environ["MINIMAX_BASE_URL"]
 expect("MiniMax asks with mmx's own key on the host mmx names", credentials(), ["mmx_saved", "https://api.minimaxi.com"])
+
+# Wherever the host comes from, the key never goes over plain HTTP to another
+# machine, nor to a URL that isn't one.
+for name, setup in (
+  ("MINIMAX_BASE_URL", lambda: os.environ.update(MINIMAX_API_KEY="mmx_env", MINIMAX_BASE_URL="http://evil.example")),
+  ("mmx's base_url", lambda: write_json(home() / ".mmx" / "config.json", {"api_key": "mmx_saved", "base_url": "http://evil.example"})),
+  ("mmx's resource_url", lambda: write_json(home() / ".mmx" / "config.json", {"oauth": {"access_token": "mmx_oauth", "resource_url": "not a url"}})),
+):
+  setup()
+  record, http = minimax(ANSWER)
+  expect(f"MiniMax sends its key to no untrusted endpoint from {name}",
+         [http.count, record["usageStatusText"], "HTTPS" in record["authHelpText"]], [0, "MiniMax limits unavailable", True], record)
+  os.environ.pop("MINIMAX_API_KEY", None)
+  os.environ.pop("MINIMAX_BASE_URL", None)
 
 # A key saved under a provider id MiniMax doesn't bill belongs to a gateway
 # in front of it, and is never sent to MiniMax as a bearer.

@@ -85,13 +85,14 @@ expect("Claude collector reads every model-scoped window once and drops unusable
   {"label": "claude-opus-5 Weekly", "title": "claude-opus-5 Weekly", "percent": 0.42, "resetsAt": ""},
 ], limits)
 
-# A payload that speaks fractions says so in its buckets, and the scoped
-# entries are read on the same scale rather than assuming percentages.
-fractions = read_limits({"five_hour": {"utilization": 0.78}, "limits": [
-  {"kind": "session", "percent": 0.78, "scope": None},
-  {"kind": "weekly_scoped", "percent": 0.42, "scope": {"model": {"display_name": "Fable"}}},
+# Every value is a percentage, as Claude Code renders them
+# (`${Math.floor(utilization)}% used`): just after a reset, a window at 0.6%
+# is 0.6%, never read as the fraction 0.6.
+low = read_limits({"five_hour": {"utilization": 0.6}, "seven_day": {"utilization": 0.8}, "limits": [
+  {"kind": "session", "percent": 0.6, "scope": None},
+  {"kind": "weekly_scoped", "percent": 0, "scope": {"model": {"id": "claude-fable-5", "display_name": "Fable"}}},
 ]})
-expect("Claude collector reads scoped percentages on the payload's own scale", [entry["percent"] for entry in fractions["limits"]], [0.78, 0.42], fractions)
+expect("Claude collector reads values below 1 as percentages", [entry["percent"] for entry in low["limits"]], [0.006, 0.008, 0.0], low)
 
 # An account with no model-scoped allowance, and an endpoint that never grew
 # the array, both keep the session and weekly windows they always had.
@@ -99,6 +100,18 @@ for payload in ({"five_hour": {"utilization": 78.0}, "limits": [{"kind": "sessio
                 {"five_hour": {"utilization": 78.0}, "seven_day": {"utilization": 12.0}}):
   read = read_limits(payload)
   check("Claude collector adds no limit when the payload scopes none", not any(" Weekly" in entry["label"] for entry in read["limits"]), read)
+
+# The week is `seven_day`, the row Claude Code's /usage titles "Current week
+# (all models)"; `seven_day_oauth_apps` is a side bucket it never shows as
+# the weekly limit, even when it holds numbers of its own.
+both = read_limits({
+  "five_hour": {"utilization": 11.0, "resets_at": "2026-10-22T15:20:00+00:00"},
+  "seven_day": {"utilization": 13.0, "resets_at": "2026-10-25T06:00:00+00:00"},
+  "seven_day_oauth_apps": {"utilization": 64.0, "resets_at": "2026-10-23T01:00:00+00:00"},
+})
+expect("Claude's weekly meter is the account's seven_day window, not the OAuth apps bucket",
+       [(entry["label"], entry["percent"], entry["resetsAt"]) for entry in both["limits"]],
+       [("Session (5-hour)", 0.11, "2026-10-22T15:20:00+00:00"), ("Weekly (7-day)", 0.13, "2026-10-25T06:00:00+00:00")], both)
 
 # A rate-limited check says when to try again, as Anthropic's refusal does.
 refused = read_limits(None, headers={"retry-after": "42"})
@@ -133,6 +146,20 @@ for ago, age, live in ((60, "a minute", True), (1800, "half an hour", False)):
   expect(f"a rate-limited re-check of numbers {age} old counts as {'current' if live else 'stale'}, with no sooner retry",
          [record["limitsStale"], record["limits"][0]["percent"], record["limitsFetchedAt"] == fetched_at, record.get("retryAdvised", False)],
          [not live, 0.4, True, False], record)
+
+# The single home keeps its numbers under who it is signed in as, so signing
+# it in to another account never shows the last one's, stale or current.
+sandbox()
+signed_in()
+write_json(home() / ".claude.json", {"oauthAccount": {"accountUuid": "acct-A"}})
+record, _ = claude()
+expect("Claude's single home reads account A's limits", [entry["percent"] for entry in record["limits"]], [0.4, 0.1], record)
+signed_in(token="token-b")
+write_json(home() / ".claude.json", {"oauthAccount": {"accountUuid": "acct-B"}})
+for mode in ("down", 429):
+  record, _ = claude(mode=mode)
+  expect(f"account B signed in to the same home never shows account A's limits ({mode})",
+         [record["limits"], record["usageStatusText"]], [[], "Claude limits unavailable"], record)
 
 # ------------------------------------------------------------ the sign-in
 

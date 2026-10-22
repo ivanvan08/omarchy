@@ -144,6 +144,13 @@ hours = muse({"body": {"subs_tier_name": "T", "subs_usage": {"window": {"used_pe
                                                            "weekly": {"used_percent": 1, "resets_at": 4103049600}}}})
 expect("Muse labels a whole-hour session window in hours", hours["limits"][0]["label"], "Session (2-hour)", hours)
 
+# omp's schema for these windows takes resets_at as a string or a number, and
+# reads a string as an ISO time.
+iso = muse({"body": {"subs_tier_name": "T", "subs_usage": {"window": {"used_percent": 5, "resets_at": "2100-01-01T00:00:00Z"},
+                                                         "weekly": {"used_percent": 1, "resets_at": "2100-01-08T00:00:00+00:00"}}}})
+expect("Muse reads a reset given as an ISO time", [entry["resetsAt"] for entry in iso["limits"]],
+       ["2100-01-01T00:00:00+00:00", "2100-01-08T00:00:00+00:00"], iso)
+
 # ---------------------------------------------------------------- the login
 
 # A malformed login file is a missing credential, not a crash: the Muse CLI is

@@ -244,9 +244,21 @@ def extract_tier(data):
 
 
 # How much of a bucket is spent, or None when its fraction isn't a number.
+# A bucket's remainder is either a fraction or an amount, which gives no
+# share of the whole to show unless it's zero, and either arrives even when
+# it is zero. Proto3 JSON leaves zero values out of answers without that
+# choice, so a bucket with a reset time and neither has none left: fully
+# spent. A disabled bucket counts against nothing.
 def used(bucket):
-  remaining = bucket.get("remainingFraction", bucket.get("remaining_fraction", 1.0))
-  if isinstance(remaining, bool):
+  if bucket.get("disabled") is True:
+    return None
+  remaining = bucket.get("remainingFraction", bucket.get("remaining_fraction"))
+  amount = bucket.get("remainingAmount", bucket.get("remaining_amount"))
+  if remaining is None and amount is not None:
+    return 1.0 if amount in (0, "0") and not isinstance(amount, bool) else None
+  if remaining is None and reset_of(bucket):
+    return 1.0
+  if remaining is None or isinstance(remaining, bool):
     return None
   try:
     remaining = float(remaining)
@@ -262,19 +274,38 @@ def reset_of(bucket):
   return parsed.isoformat() if parsed else ""
 
 
+# The quota summary is asked for the project the plan's answer names, as agy
+# and omp ask it, its id given as a string or as {id}; an answer naming none
+# leaves the body empty.
+def project_body(data):
+  project = data.get("cloudaicompanionProject") if isinstance(data, dict) else None
+  project = project.get("id") if isinstance(project, dict) else project
+  return {"project": project.strip()} if isinstance(project, str) and project.strip() else {}
+
+
+# Whether an answer's `key` is a list, or not there at all.
+def listed(data, key):
+  return data.get(key) is None or isinstance(data[key], list)
+
+
 # The Gemini group's 5-hour and weekly buckets are the plan's own limits; the
 # other groups (Claude and GPT models) are scoped allowances, shown once
 # they have been touched. An answer that lists its buckets without groups
-# lists the Gemini ones.
+# lists the Gemini ones. An answer of another shape (not an object, an error,
+# groups or the Gemini buckets that aren't a list) is None, a failed check
+# rather than a plan without quotas; another group's buckets of the wrong
+# shape skip that group.
 def extract_limits(data):
-  if not isinstance(data, dict):
-    return []
+  if not isinstance(data, dict) or "error" in data or not listed(data, "groups") or not listed(data, "buckets"):
+    return None
   groups = [g for g in data.get("groups") or [] if isinstance(g, dict)]
-  if not groups and isinstance(data.get("buckets"), list):
+  if not groups and data.get("buckets"):
     groups = [{"displayName": "Gemini", "buckets": data["buckets"]}]
   if not groups:
     return []
   gemini = next((g for g in groups if "gemini" in str(g.get("displayName") or "").lower()), groups[0])
+  if not listed(gemini, "buckets"):
+    return None
 
   limits = []
   session = weekly = None
@@ -298,7 +329,8 @@ def extract_limits(data):
       continue
     group_name = str(group.get("displayName") or "").strip()
     short = "Claude/GPT" if "claude" in group_name.lower() else (group_name or "3P")
-    for bucket in group.get("buckets") or []:
+    buckets = group.get("buckets")
+    for bucket in buckets if isinstance(buckets, list) else []:
       if isinstance(bucket, dict) and (used(bucket) or 0) > 0:
         title = f"{short} {'Weekly' if 'week' in str(bucket.get('window') or '').lower() else 'Session'}"
         limits.append({"label": title, "title": title, "percent": used(bucket), "resetsAt": reset_of(bucket)})
@@ -307,12 +339,12 @@ def extract_limits(data):
 
 # The bearer token goes wherever CLOUD_CODE_URL points, so a destination
 # named there is taken only over https, and anything else is Google's own.
-def post(endpoint, token):
+def post(endpoint, token, body=None):
   base = (os.environ.get("CLOUD_CODE_URL") or DEFAULT_CLOUD_CODE_URL).rstrip("/")
   if not base.startswith("https://"):
     base = DEFAULT_CLOUD_CODE_URL
   request = urllib.request.Request(
-    f"{base}/v1internal:{endpoint}", data=b"{}",
+    f"{base}/v1internal:{endpoint}", data=json.dumps(body or {}).encode(),
     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "antigravity"},
   )
   return open_json(request, timeout=8)
@@ -388,8 +420,11 @@ def collect_limits(entries, force):
   refused, failure = [], None
   for entry in fresh:
     try:
-      tier = extract_tier(post("loadCodeAssist", entry["accessToken"]))
-      limits = extract_limits(post("retrieveUserQuotaSummary", entry["accessToken"]))
+      assist = post("loadCodeAssist", entry["accessToken"])
+      tier = extract_tier(assist)
+      limits = extract_limits(post("retrieveUserQuotaSummary", entry["accessToken"], project_body(assist)))
+      if limits is None:
+        raise HttpError()
     except HttpError as error:
       # A refused sign-in gives way to the next one; any other status is
       # Google answering for every sign-in alike.
@@ -441,10 +476,12 @@ def omp_usage(omp):
       [omp, "usage", "--json", "--provider", "google-antigravity"],
       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20, check=True,
     ).stdout
-    reports = [r for r in json.loads(output).get("reports") or [] if isinstance(r, dict) and r.get("provider") == "google-antigravity"]
+    reports = json.loads(output).get("reports")
   except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
     return None
-  if not reports:
+  # A report of another shape is no answer, never one without limits.
+  reports = [r for r in reports if isinstance(r, dict) and r.get("provider") == "google-antigravity"] if isinstance(reports, list) else []
+  if not reports or not listed(reports[0], "limits"):
     return None
   groups, seen = {}, set()
   for limit in reports[0].get("limits") or []:

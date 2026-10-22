@@ -100,6 +100,35 @@ read = limits({"buckets": [
 expect("Antigravity collector reads snake_case buckets listed without groups and skips unreadable fractions",
        [(entry["label"], round(entry["percent"], 2), entry["resetsAt"]) for entry in read], [("Session (5-hour)", 0.6, "2026-09-15T19:31:46+00:00")], read)
 
+read = limits({"buckets": [{"window": "5h", "resetTime": "2026-09-15T19:31:46Z"}, {"window": "weekly"}]})
+expect("Antigravity collector reads a bucket whose zero fraction proto3 JSON left out as fully spent, and skips one with no reset either",
+       [(entry["label"], entry["percent"]) for entry in read], [("Session (5-hour)", 1.0)], read)
+
+# agy's QuotaSummaryBucket holds its remainder as a oneof of a fraction and an
+# amount (an int64, a string in JSON), so a bucket on the amount arm has no
+# fraction yet isn't spent unless the amount is zero; a disabled bucket is
+# skipped, as omp's reader skips it.
+read = limits({"groups": [
+  {"displayName": "Gemini Models", "buckets": [
+    {"window": "5h", "remainingAmount": "800", "resetTime": "2026-09-15T19:31:46Z"},
+    {"window": "weekly", "remainingAmount": "0", "resetTime": "2026-09-17T18:19:42Z"},
+  ]},
+  {"displayName": "Claude and GPT models", "buckets": [
+    {"window": "5h", "disabled": True, "resetTime": "2026-09-15T22:16:22Z"},
+  ]},
+]})
+expect("Antigravity collector reads a bucket's amount arm, spent only at zero, and skips a disabled bucket",
+       [(entry["label"], entry["percent"]) for entry in read], [("Weekly (7-day)", 1.0)], read)
+
+# An answer of another shape is no answer, not a plan without quotas; another
+# group's buckets of the wrong shape skip that group alone.
+gemini = {"displayName": "Gemini Models", "buckets": [{"window": "5h", "remainingFraction": 0.5}]}
+shapes = [None, [1], {"error": {"code": 500}}, {"groups": 5}, {"groups": "abc"}, {"buckets": 5},
+          {"groups": [{"displayName": "Gemini Models", "buckets": 5}]}]
+expect("Antigravity collector reads an answer of another shape as none", [limits(shape) for shape in shapes], [None] * len(shapes))
+read = limits({"groups": [gemini, {"displayName": "Claude and GPT models", "buckets": 5}]})
+expect("Antigravity collector skips another group's buckets of the wrong shape", [(entry["label"], entry["percent"]) for entry in read], [("Session (5-hour)", 0.5)], read)
+
 # ---------------------------------------------------------------- contract
 
 machine()
@@ -119,6 +148,15 @@ check_scan_cache(adapter)
 
 record, http = agy()
 expect("Antigravity collector asks with agy's token", {r["headers"].get("authorization") for r in http.requests}, {"Bearer token-main"})
+
+# agy's RetrieveUserQuotaSummaryRequest carries the project, which omp sends
+# from loadCodeAssist's cloudaicompanionProject, named as a string or {id}.
+asked = []
+for project in ("proj-1", {"id": "proj-2", "name": "Default"}, None):
+  routes = dict(ANSWER, **{TIER: dict(ANSWER[TIER], cloudaicompanionProject=project)})
+  _, http = agy(routes=routes)
+  asked += [json.loads(r["data"] or b"{}") for r in http.requests if QUOTA in r["url"]]
+expect("Antigravity collector asks for the quota of the project loadCodeAssist names", asked, [{"project": "proj-1"}, {"project": "proj-2"}, {}])
 caches = [path.name for path in limits_cache_files("agy")]
 check("Antigravity collector caches limits per account, named by a digest rather than the email",
       len(caches) == 1 and re.fullmatch(r"agy-limits-[0-9a-f]{16}\.json", caches[0]) and "me@example.com" not in caches[0], caches)
@@ -132,6 +170,15 @@ record, _ = agy("down")
 expect("Antigravity collector drops a damaged kept window and shows an elapsed one at zero",
        record["limits"], [{"label": "Session (5-hour)", "title": "Session", "percent": 0.0, "resetsAt": ""}], record)
 agy()
+
+# A quota answer of another shape is a failed check: the kept limits stand,
+# stale, and stay kept for the next failure.
+record, _ = agy(routes={TIER: ANSWER[TIER], QUOTA: {"groups": 5}})
+after, _ = agy("down")
+expect("Antigravity collector keeps the last limits over a quota answer of another shape",
+       [[entry["percent"] for entry in record["limits"]], record["limitsStale"], record["retryAdvised"], "couldn't be read" in record["authHelpText"],
+        [entry["percent"] for entry in after["limits"]], after["limitsStale"]],
+       [[0.25], True, False, True, [0.25], True], [record, after])
 
 # ------------------------------------------------------------ the sign-in
 

@@ -90,17 +90,24 @@ opencode_db(message=[("m1", "ses_a", oc_v1("openrouter", 100, model="openai/gpt-
 record = openrouter(OPENROUTER_API_KEY="sk-test")
 expect("a model is named without its provider prefix", sorted(record["modelUsage"]), ["gpt-4o-mini"], record)
 
-# /activity folds prompt tokens into input, and completion and reasoning
-# tokens into output (thinking counts as output), one bucket per model.
+# /activity folds prompt tokens into input and completion tokens into output,
+# one bucket per model. Reasoning is part of the completion count (OpenRouter's
+# AI SDK provider reads text = completion - reasoning), so it is never added
+# again; the first row is the spec's own ActivityItem example. A row naming
+# reasoning alone still counts it as output.
 activity = module.summarize_activity([
-  {"date": TODAY.strftime("%Y-%m-%d"), "model": "openai/gpt-4o-mini", "prompt_tokens": 50, "completion_tokens": 25, "reasoning_tokens": 10},
+  {"byok_usage_inference": 0.012, "cached_tokens": 10, "completion_tokens": 125, "date": TODAY.strftime("%Y-%m-%d"),
+   "endpoint_id": "550e8400-e29b-41d4-a716-446655440000", "model": "openai/gpt-4.1", "model_permaslug": "openai/gpt-4.1-2025-04-14",
+   "prompt_tokens": 50, "provider_name": "OpenAI", "reasoning_tokens": 25, "requests": 5, "usage": 0.015},
+  {"date": TODAY.strftime("%Y-%m-%d"), "model": "openai/gpt-4o-mini", "prompt_tokens": 5, "completion_tokens": 0, "reasoning_tokens": 4},
   {"date": "2020-01-01", "model": "x/y-model", "prompt_tokens": 7, "completion_tokens": 3, "reasoning_tokens": 0},
   "garbage-row",
 ], TODAY)
-expect("activity folds prompt, completion and reasoning tokens per model, with its active dates",
-       [activity["todayTotalTokens"], sorted(activity["modelUsage"]), len(activity["activeDates"])], [85, ["gpt-4o-mini", "y-model"], 2], activity)
-expect("activity counts reasoning tokens as output, never input",
-       [activity["modelUsage"]["gpt-4o-mini"]["inputTokens"], activity["modelUsage"]["gpt-4o-mini"]["outputTokens"]], [50, 35], activity)
+expect("activity folds prompt and completion tokens per model, with its active dates",
+       [activity["todayTotalTokens"], sorted(activity["modelUsage"]), len(activity["activeDates"])], [184, ["gpt-4.1-2025-04-14", "gpt-4o-mini", "y-model"], 2], activity)
+expect("activity counts reasoning inside the completion tokens, once, as output",
+       [activity["modelUsage"]["gpt-4.1-2025-04-14"]["inputTokens"], activity["modelUsage"]["gpt-4.1-2025-04-14"]["outputTokens"],
+        activity["modelUsage"]["gpt-4o-mini"]["outputTokens"]], [50, 125, 4], activity)
 expect("a key without a credit limit has no meter, and one with a limit names its period, not a reset time",
        [module.key_limit_meter({"limit": None, "limit_remaining": None}), module.key_limit_meter({"limit": 10, "limit_remaining": 4, "limit_reset": "weekly"})],
        [[], [{"label": "Weekly key limit", "title": "Weekly key limit", "percent": 0.6, "resetsAt": ""}]])
@@ -137,7 +144,7 @@ sandbox()
 record = openrouter(OPENROUTER_API_KEY="sk-test", OPENROUTER_MANAGEMENT_KEY="sk-mgmt")
 expect("a management key's history is account-wide, with no prompt counts, beside the balance",
        picked(record, "scope", "hasPromptStats", "todayTotalTokens") + [remaining(record), openrouter.asked],
-       ["account", False, 15, 9.0, ["/activity=sk-mgmt", "/credits=sk-test", "/key=sk-test"]], record)
+       ["account", False, 15, 9.0, ["/activity=sk-mgmt", "/credits=sk-mgmt", "/key=sk-test"]], record)
 
 # A management key alone still collects the history and the balance, with no
 # inference key's meter to show.
@@ -193,14 +200,19 @@ expect("opencode's saved OpenRouter key comes before pi's", openrouter.asked, ["
 
 # A "management" key that /activity refuses (an inference key, or one
 # revoked) falls back to the local scan: machine numbers with prompt counts,
-# and no sign-in asked for, since the inference key still answers.
+# and no sign-in asked for, since the inference key still answers, and reads
+# the balance /credits refuses the other key.
 sandbox()
 write_pi_session(home() / ".pi" / "agent" / "sessions" / "--p--" / "s.jsonl", [pi_reply("openrouter", 100, id="a1", model="anthropic/claude-test")])
 for code in (401, 403):
-  record = openrouter(OPENROUTER_API_KEY="sk-test", OPENROUTER_MANAGEMENT_KEY="sk-refused", routes=with_routes(activity=code))
+  def refused_manager(request, code=code):
+    if request.get_header("Authorization") == "Bearer sk-refused":
+      return FakeHttp.refusal(request.full_url, code, {"error": {"code": code, "message": "refused"}})
+    return CREDITS
+  record = openrouter(OPENROUTER_API_KEY="sk-test", OPENROUTER_MANAGEMENT_KEY="sk-refused", routes=with_routes(activity=code, credits=refused_manager))
   expect(f"a management key /activity refuses ({code}) falls back to the local scan",
-         picked(record, "scope", "hasPromptStats", "totalPrompts", "todayTotalTokens", "usageStatusText", "retryAdvised") + [openrouter.asked],
-         [None, True, 1, 100, "", None, ["/activity=sk-refused", "/credits=sk-test", "/key=sk-test"]], record)
+         picked(record, "scope", "hasPromptStats", "totalPrompts", "todayTotalTokens", "usageStatusText", "retryAdvised") + [remaining(record), openrouter.asked],
+         [None, True, 1, 100, "", None, 9.0, ["/activity=sk-refused", "/credits=sk-refused", "/credits=sk-test", "/key=sk-test"]], record)
 
 # ---------------------------------------------------------- failed checks
 
@@ -222,6 +234,37 @@ for code in (401, 403):
   expect(f"a {code} keeps the last meter and asks to sign in again",
          picked(refused, "usageStatusText", "limitsStale", "retryAdvised", "ready", "limits") + [refused["authHelpText"].startswith("OpenRouter refused the API key. ")],
          ["Sign-in expired", True, None, True, fresh["limits"], True], refused)
+
+# OpenRouter documents /credits as management-key only, answering an
+# inference key with its 403 example. That key is healthy: the meter shows,
+# with no balance and nothing to sign in to again, and the refusal is kept, so
+# later refreshes don't ask again. A management key, when there is one, reads
+# the balance instead, the only /credits request.
+def management_only(request):
+  if request.get_header("Authorization") == "Bearer sk-mgmt":
+    return CREDITS
+  return FakeHttp.refusal(request.full_url, 403, {"error": {"code": 403, "message": "Only management keys can perform this operation"}})
+
+
+sandbox()
+record = openrouter(OPENROUTER_API_KEY="sk-test", routes=with_routes(credits=management_only))
+expect("an inference key /credits refuses still shows its meter, with no balance and no sign-in asked",
+       picked(record, "usageStatusText", "authHelpText", "limitsStale", "balance", "retryAdvised") + [len(record["limits"]), openrouter.asked],
+       ["", "", False, None, None, 1, ["/credits=sk-test", "/key=sk-test"]], record)
+record = openrouter(OPENROUTER_API_KEY="sk-test", routes=with_routes(credits=management_only))
+expect("an inference key /credits refused isn't asked again on the next refresh",
+       picked(record, "usageStatusText", "limitsStale", "balance") + [len(record["limits"]), openrouter.asked],
+       ["", False, None, 1, ["/key=sk-test"]], record)
+record = openrouter(OPENROUTER_API_KEY="sk-test", OPENROUTER_MANAGEMENT_KEY="sk-mgmt",
+                    routes=with_routes(credits=management_only))
+expect("a management key reads the balance an inference key is refused",
+       picked(record, "usageStatusText", "limitsStale") + [remaining(record), openrouter.asked],
+       ["", False, 9.0, ["/activity=sk-mgmt", "/credits=sk-mgmt", "/key=sk-test"]], record)
+
+# A key /credits answers, where OpenRouter still lets one read it, in a fresh
+# home, since the refusal above is kept for sk-test.
+sandbox()
+os.environ["OPENROUTER_API_KEY"] = "sk-test"
 
 # A failed /credits keeps the last good balance, marked stale; with none
 # kept, the balance says it is unavailable.
@@ -257,4 +300,43 @@ for incomplete in ({"data": {}}, {}, {"data": {"limit": 10}}, {"data": {"limit":
 openrouter()
 record = openrouter(routes=with_routes(key={"data": {"limit": None, "limit_remaining": None}}))
 expect("an unlimited key replaces the meter with none, fresh", picked(record, "limits", "limitsStale", "usageStatusText"), [[], False, ""], record)
+# Claude Code pointed at OpenRouter's Anthropic-compatible API is
+# OpenRouter's, counted from this machine even with no key.
+sandbox()
+claude_code_session("or", [("anthropic/claude-sonnet-4.5", 70), ("claude-sonnet-4-5", 40)])
+record = openrouter()
+expect("OpenRouter counts no Claude Code reply while Claude Code is sent to Anthropic", [record["todayTokensByModel"], record["ready"]], [{}, False], record)
+claude_code_session("or", [("anthropic/claude-sonnet-4.5", 70), ("claude-sonnet-4-5", 40)], base_url="https://openrouter.ai/api")
+record = openrouter()
+expect("OpenRouter counts every Claude Code reply while Claude Code is pointed at it",
+       [record["todayTokensByModel"], record["todayPrompts"], record["usageStatusText"]], [{"claude-sonnet-4.5": 70, "claude-sonnet-4-5": 40}, 2, "Waiting for auth"], record)
+
+# OpenRouter usage that other harnesses keep: DeepSeek Harness's pi-ai
+# `openrouter` route (its DeepSeek routes are DeepSeek's), a Kimchi session
+# run with `--provider openrouter` (its gateway routes are Kimchi's), and a
+# MiniMax Code custom provider at openrouter.ai (one elsewhere isn't).
+sandbox()
+os.environ["DSH_HOME"] = str(home() / "dsh")
+dsh_log = home() / "dsh" / "sessions" / "--home-me--" / "s1" / "session.v4.jsonl"
+dsh_log.parent.mkdir(parents=True)
+dsh_log.write_text("".join(json.dumps(line) + "\n" for line in (
+  {"type": "session", "version": 4, "id": "s1", "createdAt": ms_in(0), "isSeeded": False},
+  {"type": "user/message", "seq": 0, "time": ms_in(0), "data": {"source": {"kind": "user"}, "role": "user", "id": "u1"}},
+  {"type": "request/header", "seq": 1, "time": ms_in(0), "data": {"header": {"config": {"provider": "openrouter", "model": "z-ai/glm-mock"}}}},
+  {"type": "assistant/message", "seq": 2, "time": ms_in(0), "data": {"turn": 1, "step": 1, "usage": {"inputTokens": 5234, "outputTokens": 55, "cacheReadTokens": 75}}},
+  {"type": "request/header", "seq": 3, "time": ms_in(0), "data": {"header": {"config": {"provider": "deepseek-official", "model": "deepseek-flash"}}}},
+  {"type": "assistant/message", "seq": 4, "time": ms_in(0), "data": {"turn": 2, "step": 1, "usage": {"inputTokens": 999}}},
+)))
+write_pi_session(home() / ".config" / "kimchi" / "harness" / "sessions" / "--home-me--" / "k.jsonl", [
+  pi_reply("openrouter", id="k1", model="z-ai/glm-or-mock", usage={"input": 5234, "output": 55, "cacheRead": 75, "totalTokens": 5364}),
+  pi_reply("kimchi-dev/zai", id="k2", model="glm-mock", usage={"input": 777}),
+])
+mcode_routed_session("m1", "custom_provider:router", "z-ai/glm-mcode", 2358, base_url="https://openrouter.ai/api/v1")
+mcode_routed_session("m2", "custom_provider:acme", "acme", 444, base_url="https://llm.acme.example/v1")
+record = openrouter()
+expect("OpenRouter counts dsh's openrouter route, Kimchi's --provider openrouter, and MiniMax Code at openrouter.ai, nothing else of theirs",
+       [record["todayTokensByModel"], record["todayPrompts"], record["todaySessions"]],
+       [{"glm-mock": 5364, "glm-or-mock": 5364, "glm-mcode": 2358}, 3, 3], record)
+del os.environ["DSH_HOME"]
+
 PY

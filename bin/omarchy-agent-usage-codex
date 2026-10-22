@@ -40,6 +40,7 @@ from collectors import (  # noqa: E402
   local_day,
   now_ms,
   number,
+  obj,
   opencode_db,
   pi_session_roots,
   read_json,
@@ -77,8 +78,12 @@ TRANSPORT_ERRORS = (
 # Per-file totals of native Codex sessions survive between runs, so a rescan
 # only reads the session files that changed. Bumping the schema retires every
 # record written by an older layout; version 2 reads token counts and times
-# the way every collector reads them.
-FILE_CACHE_SCHEMA = 2
+# the way every collector reads them, and version 3 drops totals cached while a
+# falsy time still counted on the file's day, version 4 counts typed prompts
+# apart from the requests that answered them, version 5 counts Codex 0.163's
+# token_usage_record lines, and version 6 books a subagent's thread under the
+# session that started it.
+FILE_CACHE_SCHEMA = 6
 
 
 
@@ -148,27 +153,73 @@ STATS = Stats()
 
 
 # One session file's totals, the unit the file cache stores: day -> model ->
-# [input, output, cacheRead, cacheWrite, prompts]. Day-keyed and with no
-# "today" in it, so a record stays true however long it is kept.
-def new_file_record(stat_result):
-  return {"mtime": stat_result.st_mtime, "size": stat_result.st_size, "days": {}}
+# [input, output, cacheRead, cacheWrite], and day -> the prompts typed that
+# day. Day-keyed and with no "today" in it, so a record stays true however long
+# it is kept.
+# "session" is the thread a person started, or None for a thread nothing
+# names a starter for.
+def new_file_record(stat_result, session):
+  return {"mtime": stat_result.st_mtime, "size": stat_result.st_size, "session": session, "days": {}, "prompts": {}}
 
 
 def record_usage(record, day, model, input_tokens, output_tokens, cache_read, cache_write):
-  totals = record["days"].setdefault(day, {}).setdefault(model, [0, 0, 0, 0, 0])
+  totals = record["days"].setdefault(day, {}).setdefault(model, [0, 0, 0, 0])
   totals[0] += input_tokens
   totals[1] += output_tokens
   totals[2] += cache_read
   totals[3] += cache_write
-  totals[4] += 1
 
 
-def merge_file_record(session_key, record):
+def merge_file_record(record):
   """Fold one file's totals, freshly read or replayed from cache, into the run:
-  each day and model's tokens at once, with the replies they took."""
+  each day and model's tokens at once, and the prompts typed each day. One
+  prompt can take many requests, one per tool call it makes, so the requests
+  count no prompts of their own."""
+  session_key = record["session"]
   for day, models in record["days"].items():
-    for model, (input_tokens, output_tokens, cache_read, cache_write, prompts) in models.items():
-      STATS.add(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write, prompts=prompts)
+    for model, (input_tokens, output_tokens, cache_read, cache_write) in models.items():
+      STATS.add(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write, prompts=0)
+  for day, prompts in record["prompts"].items():
+    STATS.add_prompts(day, session_key, prompts)
+
+
+def typed_prompt(entry):
+  """Whether a rollout line is a prompt the user typed, or a message steering
+  a running turn. Codex writes one line per prompt: an item_completed
+  UserMessage in paginated rollouts, a user_message event in legacy ones, and
+  never both. A user_message of a kind other than plain is context Codex
+  added itself."""
+  if entry.get("type") != "event_msg":
+    return False
+  payload = obj(entry.get("payload"))
+  if payload.get("type") == "user_message":
+    return payload.get("kind") in (None, "plain")
+  return payload.get("type") == "item_completed" and obj(payload.get("item")).get("type") == "UserMessage"
+
+
+def typed_session(meta):
+  # A subagent's thread, or one of Codex's own (a guardian review, memory
+  # consolidation), is prompted by Codex, not by anyone typing: its requests
+  # still spend tokens, but its messages are no prompts.
+  source = meta.get("source")
+  return not (isinstance(source, dict) and ("subagent" in source or "internal" in source))
+
+
+def rollout_session(meta, typed, path):
+  """The session a rollout's tokens count under. A thread someone started is
+  its own, by its thread id. Codex's own threads (a review, a guardian check,
+  a spawned agent) name the root thread that started them in session_id, or
+  their parent in parent_thread_id, and count under it, as a Claude Code
+  sidechain counts under its parent's sessionId: they spend tokens but start
+  no session. One that names no thread but its own, such as a memory
+  consolidation, counts under none."""
+  thread = meta.get("id")
+  if typed:
+    return str(thread or path)
+  for starter in (meta.get("session_id"), meta.get("parent_thread_id")):
+    if starter and starter != thread:
+      return str(starter)
+  return None
 
 
 # pi and omp sessions that ran through openai-codex, by provider or by the
@@ -208,6 +259,8 @@ def scan_opencode_sessions():
 
 
 def scan_native_codex_sessions(cached_files, scanned_files):
+  """Fold every native rollout into the run, and say whether each was read in
+  full."""
   home = codex_home()
   roots = [home / "sessions", home / "archived_sessions"]
   files = []
@@ -223,32 +276,57 @@ def scan_native_codex_sessions(cached_files, scanned_files):
       if stat_result.st_mtime >= cutoff:
         files.append((path, stat_result))
 
+  complete = True
   for path, stat_result in files:
     key = str(path)
     record = reusable_record(cached_files, key, stat_result)
     if record is None:
       record = read_native_codex_session(path, stat_result)
-    if record["mtime"] is not None:
+    if record["mtime"] is None:
+      complete = False
+    else:
       scanned_files[key] = record
-    merge_file_record(key, record)
+    merge_file_record(record)
+  return complete
+
+
+# The rollout lines the reader parses: usage, the model and provider serving
+# it, and the prompts typed.
+ROLLOUT_MARKERS = ('"token_count"', '"token_usage_record"', '"turn_context"', '"session_meta"', '"user_message"', '"UserMessage"')
+
+
+# What a token_usage_record's running total is compared by.
+USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
 
 
 def read_native_codex_session(path, stat_result):
-  record = new_file_record(stat_result)
+  record = new_file_record(stat_result, str(path))
   current_model = "codex"
   seen_meta = False
+  typed = True
   previous_total_usage = None
+  # Codex 0.163 writes a token_usage_record for every response it is billed
+  # for, a compaction's included, where token_count only follows a sampling
+  # request. Once one appears, the records are the usage and the token_count
+  # lines after it repeat them; those before it, from a Codex that wrote no
+  # records, still count.
+  seen_records = False
+  seen_responses = set()
   try:
     with path.open(errors="replace") as handle:
       for raw in handle:
         # Cheap pre-filter before JSON parsing keeps files with unrelated
         # lines inexpensive. session_meta still has to get through: it says
         # which provider served the rollout.
-        if '"token_count"' not in raw and '"turn_context"' not in raw and '"session_meta"' not in raw:
+        if not any(marker in raw for marker in ROLLOUT_MARKERS):
           continue
         try:
           entry = json.loads(raw)
         except Exception:
+          continue
+        # A line of the wrong shape is skipped like one that isn't JSON, not
+        # a reason to stop reading the turns after it.
+        if not isinstance(entry, dict):
           continue
         if entry.get("type") == "session_meta":
           # A forked rollout copies its parent's session_meta after its own,
@@ -261,28 +339,53 @@ def read_native_codex_session(path, stat_result):
           # local box or a third party, never this subscription, so drop the
           # whole rollout the way the pi and opencode scans drop foreign
           # providers.
-          meta = entry.get("payload") or {}
+          meta = obj(entry.get("payload"))
           provider = str(meta.get("model_provider") or "")
           # Rollouts predating the field carry no provider at all; count
           # those rather than silently lose the history.
           if provider and provider != NATIVE_PROVIDER:
             break
+          typed = typed_session(meta)
+          record["session"] = rollout_session(meta, typed, path)
+          continue
+        if typed_prompt(entry):
+          # A line with no time is the file's; one whose time can't be
+          # trusted counts nowhere.
+          stamped = entry.get("timestamp")
+          day = local_day(stat_result.st_mtime if stamped is None else stamped)
+          if typed and day is not None:
+            record["prompts"][day] = record["prompts"].get(day, 0) + 1
           continue
         if entry.get("type") == "turn_context":
-          payload = entry.get("payload") or {}
+          payload = obj(entry.get("payload"))
           current_model = model_name(payload.get("model") or payload.get("model_slug") or current_model)
           continue
-        payload = entry.get("payload") or entry
-        if entry.get("type") == "response_item" and isinstance(payload, dict):
-          payload = payload.get("payload") or payload
-        if not isinstance(payload, dict):
-          continue
-        if payload.get("type") != "token_count":
-          continue
-        info = payload.get("info") or {}
-        # total_token_usage is cumulative for the session. Adding every
-        # snapshot makes usage grow quadratically, so count the last turn.
-        usage = info.get("last_token_usage") or {}
+        if entry.get("type") == "token_usage_record":
+          seen_records = True
+          payload = obj(entry.get("payload"))
+          # One response, with its own usage and the thread's running total
+          # after it. Only the same response id under an unchanged total is a
+          # repeat: a backend may reuse an id from turn to turn.
+          thread_usage = obj(payload.get("thread_token_usage"))
+          response = (str(payload.get("response_id") or ""), *(token_count(thread_usage.get(field)) for field in USAGE_FIELDS))
+          if response in seen_responses:
+            continue
+          seen_responses.add(response)
+          usage = obj(payload.get("usage"))
+          total_usage = None
+        else:
+          payload = entry.get("payload") or entry
+          if entry.get("type") == "response_item" and isinstance(payload, dict):
+            payload = payload.get("payload") or payload
+          if not isinstance(payload, dict):
+            continue
+          if payload.get("type") != "token_count" or seen_records:
+            continue
+          info = obj(payload.get("info"))
+          # total_token_usage is cumulative for the session. Adding every
+          # snapshot makes usage grow quadratically, so count the last turn.
+          usage = obj(info.get("last_token_usage"))
+          total_usage = info.get("total_token_usage")
         cache_read = token_count(usage.get("cached_input_tokens"))
         cache_write = token_count(usage.get("cache_write_input_tokens"))
         # Cached tokens are included in input_tokens, and reasoning tokens
@@ -297,14 +400,14 @@ def read_native_codex_session(path, stat_result):
         # separate requests may have identical last-token counts, and older
         # records may not carry cumulative counters at all. Keep this state
         # per rollout and accept changed counters, including counter resets.
-        total_usage = info.get("total_token_usage")
         if isinstance(total_usage, dict) and total_usage:
           if total_usage == previous_total_usage:
             continue
           previous_total_usage = total_usage
         # A line with no time is the file's; one whose time can't be trusted
         # counts nowhere.
-        day = local_day(entry.get("timestamp") or stat_result.st_mtime)
+        stamped = entry.get("timestamp")
+        day = local_day(stat_result.st_mtime if stamped is None else stamped)
         if day is None:
           continue
         record_usage(record, day, current_model, input_tokens, output_tokens, cache_read, cache_write)
@@ -338,7 +441,9 @@ def valid_file_record(value):
     counts = [totals for models in value["days"].values() for totals in models.values()]
     return (
       type(value["mtime"]) in (int, float) and type(value["size"]) is int
-      and all(len(totals) == 5 and all(type(n) is int for n in totals) for totals in counts)
+      and (value["session"] is None or type(value["session"]) is str)
+      and all(len(totals) == 4 and all(type(n) is int for n in totals) for totals in counts)
+      and all(type(n) is int for n in value["prompts"].values())
     )
   except Exception:
     return False
@@ -403,7 +508,7 @@ def run_local_scans(max_age):
   cached_files = read_file_cache() if max_age > 0 else {}
   scanned_files = {}
   complete = scan_pi_sessions_into_stats()
-  scan_native_codex_sessions(cached_files, scanned_files)
+  complete = scan_native_codex_sessions(cached_files, scanned_files) and complete
   complete = scan_opencode_sessions() and complete
   write_file_cache(scanned_files)
   return local_stats(), complete
@@ -593,6 +698,36 @@ def individual_spend_limit(buckets, rpc_result):
   return None
 
 
+# The plans as Codex's own /status names them (SubscriptionDisplay::Status in
+# Codex 0.163's TUI), keyed by the wire planType: "pro" is the 200 plan, and
+# a "team" workspace is what Codex sells as Business.
+PLAN_NAMES = {
+  "free": "Free",
+  "go": "Go",
+  "plus": "Plus",
+  "pro": "Pro 200",
+  "prolite": "Pro 100",
+  "promax": "Pro 500",
+  "team": "Business",
+  "self_serve_business_usage_based": "Business",
+  "self_serve_business_prolite": "Business Premium",
+  "business": "Enterprise",
+  "enterprise_cbp_automation": "Enterprise (Automation)",
+  "enterprise_cbp_usage_based": "Enterprise",
+  "ent26": "Enterprise",
+  "enterprise": "Enterprise",
+  "edu": "Edu",
+  "edu_plus": "Edu Plus",
+  "edu_pro": "Edu Pro",
+}
+
+
+def plan_name(plan):
+  # A plan newer than this table keeps its wire name, made readable.
+  plan = str(plan or "")
+  return PLAN_NAMES.get(plan, plan.replace("_", " "))
+
+
 def codex_rpc_help(proc, stderr_file, exc):
   """Explain an app-server RPC failure: a live server's stall, a dead one's own
   stderr, or the login hint when it died saying nothing."""
@@ -620,16 +755,20 @@ def codex_rpc_help(proc, stderr_file, exc):
   return AUTH_HELP
 
 
+# Credits are an extra: a malformed field loses them, never the limits.
 def reset_credits(result):
-  granted = (result.get("rateLimitResetCredits") or {}).get("credits") or []
+  granted = obj(result.get("rateLimitResetCredits")).get("credits")
+  if not isinstance(granted, list):
+    return None
   available = [c for c in granted if isinstance(c, dict) and c.get("status") == "available"]
   if not available:
     return None
   expiries = [number(c.get("expiresAt")) for c in available if number(c.get("expiresAt")) > 0]
-  return {
-    "available": len(available),
-    "nextExpiresAt": datetime.fromtimestamp(min(expiries), timezone.utc).isoformat() if expiries else "",
-  }
+  try:
+    next_expiry = datetime.fromtimestamp(min(expiries), timezone.utc).isoformat() if expiries else ""
+  except (OverflowError, OSError, ValueError):
+    next_expiry = ""
+  return {"available": len(available), "nextExpiresAt": next_expiry}
 
 
 # Keyring and auto stores keep credentials outside auth.json, so only the file
@@ -740,11 +879,11 @@ def fetch_codex_rpc(home=None, primary=True):
     if not plan:
       try:
         account_msg = rpc_request(proc, 3, "account/read", timeout=2)
-        account = (account_msg.get("result") or {}).get("account") or {}
+        account = obj(obj(account_msg.get("result")).get("account"))
         plan = account.get("planType") or account.get("type") or ""
       except (TimeoutError, RuntimeError):
         pass
-    result["tierLabel"] = str(plan) if plan else ""
+    result["tierLabel"] = plan_name(plan)
 
     result["limits"] = bucket_limits(buckets)
     spend = individual_spend_limit(buckets, rpc_result)
@@ -905,8 +1044,7 @@ def codex_in_use(stats):
     or bool(find_codex_binary())
     or codex_home().exists()
     or bool(ENV.get("CODEX_ACCESS_TOKEN"))
-    or number(stats.get("totalPrompts")) > 0
-    or number(stats.get("todayPrompts")) > 0
+    or number(stats.get("totalSessions")) > 0
   )
 
 
@@ -950,7 +1088,8 @@ def main():
     AGENT_NAME,
     # In use here once it has local usage or limits to show; a machine that
     # never ran Codex prints an empty record the panel skips.
-    ready=number(stats.get("totalPrompts")) > 0 or bool(rpc["limits"]) or bool(accounts),
+    # Requests a typed prompt can't be found for still count as use.
+    ready=number(stats.get("totalSessions")) > 0 or bool(rpc["limits"]) or bool(accounts),
     hasLocalStats=True,
   )
   record.update(stats)

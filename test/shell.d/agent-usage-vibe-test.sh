@@ -1,9 +1,10 @@
 #!/bin/bash
 
-# The Mistral Vibe collector's own sources: Vibe's session logs and their
-# per-session index, the model and provider each session resolves to, the
-# plan Vibe caches, VIBE_HOME and its session_logging settings, and the model
-# names pi, omp and opencode give Mistral's models. How pi and opencode
+# The Mistral Vibe collector's own sources: Vibe's Unified Harness store, the
+# session logs older releases wrote and their per-session index, the model
+# and provider each session resolves to, the plan Vibe caches, VIBE_HOME and
+# its session_logging settings, and the model names pi, omp and opencode give
+# Mistral's models. How pi and opencode
 # stores are read (roots, forks, both opencode stores, PI_CODING_AGENT_DIR,
 # untrusted values) is held by the shared and partition tests, as is the
 # unused-machine record; the scan cache goes through the contract check.
@@ -70,7 +71,8 @@ write_messages(main_session, [
 subagent = main_session / "agents" / "explore_20260101_120100_bbbb"
 write_meta(subagent, NOW, 300, 0, 50)
 write_messages(subagent, [{"role": "user", "content": "Look around"}])
-# A session on the local llama.cpp provider is not Mistral usage.
+# A session on the local llama.cpp provider is not Mistral usage, but the
+# local collector's.
 write_meta(session_root() / "session_20260101_130000_cccc", NOW, 9000, 0, 9000, LOCAL_CONFIG)
 write_messages(session_root() / "session_20260101_130000_cccc", [{"role": "user", "content": "local"}])
 # Running totals are booked on the day the session started.
@@ -89,6 +91,9 @@ expect("Vibe counts Mistral sessions, their subagents, and typed prompts only, b
   "models": {"mistral-medium-3.5": {"inputTokens": 1000, "outputTokens": 260, "cacheReadInputTokens": 400, "cacheCreationInputTokens": 0}},
   "two days ago": 110,
 }, record)
+local = collect("local", "--force")
+expect("Local counts the Vibe session on the llama.cpp server, with its prompt",
+       [local["todayTokensByModel"], local["todayPrompts"], local["todaySessions"]], [{"local": 18000}, 1, 1], local)
 
 # A zoneless start at the edge of the calendar, in a zone off UTC, is no
 # start to book; the scan still completes, and is cached.
@@ -108,6 +113,110 @@ finally:
   time.tzset()
 expect("a zoneless start at year 1 off UTC skips that session, and the scan is cached",
        [record["totalSessions"], bool(scan_cache_files("vibe"))], [1, True], record)
+
+# --------------------------------------------------- Unified Harness store
+
+import hashlib
+
+
+# One session in the Unified Harness store, as Vibe 3 writes it: CURRENT names
+# a generation whose projection-state.json holds the camelCase public state,
+# its history kept in the chunk pool when chunked, and the journal it names
+# holds the records since. meta.json names only the model.
+def write_unified(session_id, usage, entries=(), journal=(), alias="mistral-medium-3.5", chunked=False, metadata=None, torn=b""):
+  root = session_root() / "unified" / session_id
+  generation = "0000000000000003-abcd"
+  gen = root / "generations" / generation
+  gen.mkdir(parents=True)
+  def doc(path, value):
+    path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+  session = {"id": session_id, "rootSessionId": (metadata or {}).get("root_session_id", session_id), "status": {"type": "idle"},
+             "createdAt": ms_in(0), "updatedAt": ms_in(0), "tokenUsage": usage}
+  history = {"range": "latest", "entries": [] if chunked else list(entries), "cursor": {}}
+  projection = {"projection_state_version": 1, "session_id": session_id, "snapshot_sequence": 3, "watermark": 9,
+                "snapshot": {"format": "harness.public-session-state/v1", "session": session, "history": history, "turnQueue": {}}}
+  described = {"path": "projection-state.json", "sha256": "0" * 64}
+  if chunked:
+    body = json.dumps(list(entries), sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(body).hexdigest()
+    (root / "chunks").mkdir()
+    (root / "chunks" / f"{digest}.json").write_bytes(body)
+    described["chunks"] = [digest]
+  doc(gen / "projection-state.json", projection)
+  doc(gen / "runtime-state.json", {"session_id": session_id, "snapshot_sequence": 3,
+                                   "session_metadata": {"cwd": "/tmp", "root_session_id": session_id, **(metadata or {})}})
+  doc(gen / "manifest.json", {"manifest_version": 1, "session_id": session_id, "generation": generation, "snapshot_sequence": 3,
+                              "execution_state": "quiescent", "projection_state": described,
+                              "runtime_state": {"path": "runtime-state.json", "sha256": "0" * 64},
+                              "checkpoint": {"path": "checkpoint.json", "sha256": "0" * 64},
+                              "recovery_journal_segment": {"path": "journal/0000000000000004.jsonl", "first_sequence": 4}})
+  (root / "journal").mkdir()
+  lines = [json.dumps({"recovery_journal_record_version": 1, "sequence": 4 + index, "type": kind, "payload": payload}) + "\n"
+           for index, (kind, payload) in enumerate(journal)]
+  (root / "journal" / "0000000000000004.jsonl").write_bytes("".join(lines).encode() + torn)
+  doc(root / "CURRENT", {"store_format": "mistral.vibe.unified-session-store/v1", "store_format_minor": 3, "session_id": session_id,
+                         "generation": generation, "snapshot_sequence": 3, "manifest_sha256": "0" * 64})
+  config = {"active_model": alias, "model_name": "mistral-vibe-cli-latest"} if alias else None
+  write_json(root / "meta.json", {"session_id": session_id, "start_time": NOW, "config": config})
+  return root
+
+
+def usage(input_tokens, output_tokens, cached=0):
+  return {"inputTokens": input_tokens, "outputTokens": output_tokens, "totalTokens": input_tokens + output_tokens, "cachedInputTokens": cached}
+
+
+def message(entry_id, role, source):
+  return {"type": "message", "id": entry_id, "role": role, "source": source, "content": [{"type": "text", "text": entry_id}]}
+
+
+sandbox()
+# The journal's newest envelope carries the totals since the generation was
+# published, and a record still being written counts for nothing.
+newer = {"format": "harness.public-session-state/v1", "history": {"entries": []},
+         "session": {"id": "ses_main", "createdAt": ms_in(0), "tokenUsage": usage(5000, 700, 2000)}}
+write_unified("ses_main", usage(1000, 100, 400), chunked=True, entries=[
+  message("u1", "user", "turn_start"),
+  message("a1", "assistant", "turn_start"),
+  message("r1", "user", "harness"),
+], journal=[
+  ("projection_delta", {"watermark": 10, "delta": [{"op": "append_entry", "entry": message("u2", "user", "turn_steer")}, {"op": "set_envelope", "state": newer}]}),
+], torn=b'{"type":"projection_delta","payload":{"delta":[{"op":"set_envelope","state":{"session":{"tokenUsage":{"inputTokens":999999')
+# A subagent's totals belong to the session that spawned it; its task is not a
+# prompt anyone typed.
+write_unified("ses_child", usage(300, 50), entries=[message("t1", "user", "turn_start")],
+              metadata={"root_session_id": "ses_main", "parent_session_id": "ses_main", "subagent_spawn_key": "spawn-1"})
+# A fork starts from no usage of its own, and what it copied is not its prompts.
+write_unified("ses_fork", usage(40, 10), entries=[message("c1", "user", "harness"), message("f1", "user", "turn_start")],
+              metadata={"root_session_id": "ses_main", "parent_session_id": "ses_main"})
+# A session on the local llama.cpp model config.toml adds is not Mistral
+# usage, but the local collector's.
+(home() / ".vibe").mkdir(parents=True, exist_ok=True)
+(home() / ".vibe" / "config.toml").write_text('[[models]]\nname = "qwen"\nprovider = "llamacpp"\nalias = "local"\n\n[[providers]]\nname = "llamacpp"\napi_base = "http://127.0.0.1:8080/v1"\n')
+write_unified("ses_local", usage(9000, 9000), entries=[message("l1", "user", "turn_start")], alias="local")
+with contextlib.redirect_stderr(io.StringIO()):
+  record = vibe()
+expect("Vibe counts Unified Harness sessions from the store's newest state, folding subagents into their session", {
+  key: record[key] for key in ("ready", "todayPrompts", "todaySessions", "todayTotalTokens", "totalSessions", "modelUsage")
+}, {
+  "ready": True, "todayPrompts": 3, "todaySessions": 2, "todayTotalTokens": 6100, "totalSessions": 2,
+  "modelUsage": {"mistral-medium-3.5": {"inputTokens": 3340, "outputTokens": 760, "cacheReadInputTokens": 2000, "cacheCreationInputTokens": 0}},
+}, record)
+check("Vibe caches a Unified Harness scan whose torn last journal record is still being written", bool(scan_cache_files("vibe")))
+with contextlib.redirect_stderr(io.StringIO()):
+  local = collect("local", "--force")
+expect("Local counts the Unified Harness session on the llama.cpp server, with its prompt",
+       [local["todayTokensByModel"], local["todayPrompts"]], [{"local": 18000}, 1], local)
+
+# A store whose CURRENT names a generation that isn't there leaves the scan
+# incomplete, so it isn't cached.
+sandbox()
+write_unified("ses_ok", usage(10, 5))
+write_unified("ses_broken", usage(10, 5))
+write_json(session_root() / "unified" / "ses_broken" / "CURRENT", {"generation": "missing"})
+with contextlib.redirect_stderr(io.StringIO()):
+  record = vibe()
+expect("Vibe skips a Unified Harness session it cannot read without caching the scan",
+       [record["todayTotalTokens"], bool(scan_cache_files("vibe"))], [15, False], record)
 
 # ------------------------------------------------------- model resolution
 
@@ -162,7 +271,8 @@ write_json(home() / ".vibe" / "whoami_cache.json", {
   "new": {"stored_at_timestamp": 200, "payload": {"plan_type": "chat", "plan_name": "individual"}},
 })
 record = vibe()
-expect("Vibe names the newest cached plan as Vibe does", [record["ready"], record["tierLabel"]], [True, "Pro"], record)
+expect("Vibe names the newest cached plan as Vibe does, with no local stats while no session has run",
+       [record["ready"], record["tierLabel"], record["hasLocalStats"]], [True, "Pro", False], record)
 
 write_json(home() / ".vibe" / "whoami_cache.json", {"a": {"stored_at_timestamp": 1, "payload": {"plan_type": "chat", "plan_name": "MYSTERY"}}})
 record = vibe()

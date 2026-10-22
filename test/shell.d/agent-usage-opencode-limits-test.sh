@@ -87,6 +87,19 @@ expect("OpenCode collector reads the alternate payload shape",
        [windows(record), record["limits"][0]["resetsAt"] != "", record["limits"][1]["resetsAt"]],
        [[("Rolling (5h)", 1.0), ("Weekly (7-day)", 0.125)], True, ""], record)
 
+# resetsAt is an ISO time or nothing, so an epoch, a list or garbage falls back
+# to resetInSec, and a reset further out than a date goes reads as none.
+for odd in (1792700000, ["x"], "garbage"):
+  record, _ = opencode({"usage": {
+    "rolling": {"percent": 10, "resetsAt": odd, "resetInSec": 3600},
+    "weekly": {"percent": 20, "resetsAt": odd},
+    "monthly": {"percent": 30, "resetInSec": 1e14},
+  }})
+  expect(f"OpenCode collector shows only an ISO reset time (resetsAt {odd!r})",
+         [windows(record), record["limits"][0]["resetsAt"][:4].isdigit() and "T" in record["limits"][0]["resetsAt"],
+          record["limits"][1]["resetsAt"], record["limits"][2]["resetsAt"]],
+         [[("Rolling (5h)", 0.1), ("Weekly (7-day)", 0.2), ("Monthly", 0.3)], True, "", ""], record)
+
 # With nothing kept, each way a check fails says what happened.
 for path in limits_cache_files("opencode"):
   path.unlink()
@@ -98,12 +111,13 @@ cases = {
   "a timeout": (None, "timeout", "OpenCode limits unavailable", "Couldn't reach", True),
   # A server that answered with garbage was reached; retrying soon won't help.
   "an unparseable answer": (None, "garbage", "OpenCode limits unavailable", "returned no data", False),
+  "an answer that breaks the reader": (RuntimeError("broken"), "up", "OpenCode limits unavailable", "returned no data", False),
 }
 for name, (answer, mode, status, help_text, retry) in cases.items():
   record, _ = opencode(answer, mode)
-  check(f"OpenCode collector explains {name} with nothing kept",
-        record["limits"] == [] and record["usageStatusText"] == status and help_text in record["authHelpText"]
-        and bool(record.get("retryAdvised")) is retry, record)
+  check(f"OpenCode collector explains {name} with nothing kept, and calls nothing stale",
+        record["limits"] == [] and record["limitsStale"] is False and record["usageStatusText"] == status
+        and help_text in record["authHelpText"] and bool(record.get("retryAdvised")) is retry, record)
 
 # A Zen pay-as-you-go key has no Go plan behind it. That is no trouble, and
 # the answer is remembered so the next runs don't ask again.

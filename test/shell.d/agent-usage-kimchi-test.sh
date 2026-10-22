@@ -126,6 +126,35 @@ expect("a region is matched whatever its case", kimchi.asked, ["https://llm.eu.k
 kimchi(KIMCHI_BASE_URL="https://gateway.example/openai/v1/")
 expect("KIMCHI_BASE_URL names the gateway, without its OpenAI path", kimchi.asked, ["https://gateway.example/v1/budget", "https://gateway.example/v1/credits"])
 
+# A gateway override never sends the key in the clear to another machine;
+# plain HTTP is for a gateway on this one.
+record = kimchi(KIMCHI_BASE_URL="http://gateway.example")
+expect("a plain HTTP KIMCHI_BASE_URL is never sent the key", [kimchi.asked, record["usageStatusText"], "HTTPS" in record["authHelpText"]], [[], "Balance unavailable", True], record)
+write_json(home() / ".config" / "kimchi" / "config.json", {"apiKey": "key-coder", "llmEndpoint": "http://gateway.example/openai/v1"})
+kimchi()
+expect("a plain HTTP llmEndpoint is never sent the key", kimchi.asked, [])
+kimchi(KIMCHI_BASE_URL="http://127.0.0.1:9")
+expect("plain HTTP to loopback still carries the key", kimchi.asked, ["http://127.0.0.1:9/v1/budget", "http://127.0.0.1:9/v1/credits"])
+
+# Kimchi 1.18's self-hosted login saves the region and its host but no
+# llmEndpoint, and its gateway is <host>/llm; KIMCHI_SELF_HOSTED_URL moves it.
+# Without a host the key goes nowhere, never to the public gateway.
+write_json(home() / ".config" / "kimchi" / "config.json", {"apiKey": "key-coder", "region": "self-hosted", "selfHostedUrl": "https://kimchi.example.internal/"})
+kimchi()
+expect("a self-hosted login asks its own host's gateway", kimchi.asked,
+       ["https://kimchi.example.internal/llm/v1/budget", "https://kimchi.example.internal/llm/v1/credits"])
+kimchi(KIMCHI_SELF_HOSTED_URL="https://other.example.internal")
+expect("KIMCHI_SELF_HOSTED_URL moves a self-hosted gateway", kimchi.asked,
+       ["https://other.example.internal/llm/v1/budget", "https://other.example.internal/llm/v1/credits"])
+write_json(home() / ".config" / "kimchi" / "config.json", {"apiKey": "key-coder", "region": "self-hosted"})
+record = kimchi()
+expect("a self-hosted login with no host sends its key nowhere",
+       [kimchi.asked, record["usageStatusText"], record.get("retryAdvised")], [[], "Balance unavailable", None], record)
+signed_in("key-coder")
+kimchi(KIMCHI_REGION="self-hosted", KIMCHI_SELF_HOSTED_URL="https://ci.example.internal")
+expect("KIMCHI_REGION picks the self-hosted region over the saved one", kimchi.asked,
+       ["https://ci.example.internal/llm/v1/budget", "https://ci.example.internal/llm/v1/credits"])
+
 # ------------------------------------------------------------- contract
 
 sandbox()
@@ -263,7 +292,8 @@ expect("a budget cached under its old name is read, elapsed at zero and an unclo
 
 # Tokens come from assistant messages in the harness's pi session files:
 # cached input kept apart, a repeated entry counted once, user turns and other
-# entries skipped, whatever the provider.
+# entries skipped. The one typed prompt today books on its first reply, not
+# on each step; a file without user messages keeps one per reply.
 sandbox()
 sessions = harness() / "sessions" / "--home-me--"
 now = iso_in(0)
@@ -281,12 +311,27 @@ record = kimchi(key="key-coder")
 expect("Kimchi counts sessions, prompts, and tokens from its session files",
        {key: record[key] for key in ("hasLocalStats", "todayPrompts", "todaySessions", "totalPrompts", "totalSessions", "activeDays", "todayTotalTokens", "todayTokensByModel")}
        | {"today": record["recentDays"][6]["messageCount"]},
-       {"hasLocalStats": True, "todayPrompts": 3, "todaySessions": 1, "totalPrompts": 4, "totalSessions": 2, "activeDays": 2,
+       {"hasLocalStats": True, "todayPrompts": 1, "todaySessions": 1, "totalPrompts": 2, "totalSessions": 2, "activeDays": 2,
         "todayTotalTokens": 1015, "todayTokensByModel": {"minimax-m3": 925, "glm-5.3": 90}, "today": 1015}, record)
 expect("Kimchi's tokens by model keep cached input apart", record["modelUsage"], {
   "minimax-m3": {"inputTokens": 400, "outputTokens": 50, "cacheReadInputTokens": 800, "cacheCreationInputTokens": 5},
   "glm-5.3": {"inputTokens": 85, "outputTokens": 5, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
 }, record)
+
+# Kimchi 1.18 names a reply's route as kimchi-dev/<upstream> on its gateway,
+# but `kimchi --provider openrouter` (or a custom provider in models.json)
+# runs a session that provider bills, which isn't Kimchi's usage.
+write_pi_session(sessions / "routed.jsonl", [
+  {"type": "session", "id": "s-3"},
+  pi_reply("kimchi-dev/moonshotai", id="r-1", model="kimi-k2.6", usage={"input": 1234, "output": 51, "cacheRead": 71, "totalTokens": 1356}),
+  pi_reply("kimchi-experimental", id="r-2", model="glm-5.3", usage={"input": 4, "output": 1}),
+  pi_reply("openrouter", id="r-3", model="z-ai/glm-4.6", usage={"input": 5234, "output": 55, "cacheRead": 75, "totalTokens": 5364}),
+  pi_reply("kimchi-devious", id="r-4", model="glm-5.3", usage={"input": 999}),
+])
+record = kimchi(key="key-coder")
+expect("Kimchi counts only replies on its own gateway routes",
+       [record["todayTotalTokens"], record["todayTokensByModel"]], [1015 + 1356 + 5, {"minimax-m3": 925, "glm-5.3": 95, "kimi-k2.6": 1356}], record)
+(sessions / "routed.jsonl").unlink()
 
 # KIMCHI_CODING_AGENT_DIR moves the harness, as it does for the CLI.
 write_pi_session(home() / "elsewhere" / "sessions" / "--elsewhere--" / "s.jsonl", [reply("x-1", "kimi-k2.6", {"input": 7, "output": 3})])

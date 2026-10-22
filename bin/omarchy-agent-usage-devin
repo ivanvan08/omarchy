@@ -72,8 +72,8 @@ LIMITS_CURRENT_ENOUGH_SECONDS = 900
 # when the plan carries no name of its own.
 TEAMS_TIER = {
   1: "Teams", 2: "Pro", 3: "Enterprise Saas", 4: "Hybrid", 5: "Enterprise Self Hosted",
-  6: "Waitlist Pro", 7: "Teams Ultimate", 9: "Trial", 10: "Enterprise Self Serve",
-  12: "Devin Enterprise", 14: "Devin Teams", 15: "Devin Teams V2", 16: "Devin Pro",
+  6: "Waitlist Pro", 7: "Teams Ultimate", 8: "Pro Ultimate", 9: "Trial", 10: "Enterprise Self Serve",
+  11: "Enterprise Saas Pooled", 12: "Devin Enterprise", 14: "Devin Teams", 15: "Devin Teams V2", 16: "Devin Pro",
   17: "Devin Max", 18: "Max", 19: "Devin Free", 20: "Devin Trial",
 }
 
@@ -232,11 +232,15 @@ def scan_sources():
   return [Path.home(), data_dir(), data_home(), *pi_session_roots(), opencode_db()]
 
 
-def run_local_scans():
+# The local stats and whether every source was read; a session database that
+# couldn't be read is added to `unreadable`.
+def run_local_scans(unreadable):
   stats = Stats()
   pi_rows, complete = scan_pi_sessions(r'"provider"\s*:\s*"devin"', billed_here)
   for path in session_databases():
-    complete = scan_devin_database(path, stats) and complete
+    if not scan_devin_database(path, stats):
+      complete = False
+      unreadable.append(path)
   # The closing quote makes the database's prefilter match the whole id.
   db_rows, db_complete = scan_opencode([PROVIDER + '"'], billed_here)
   for row in pi_rows + db_rows:
@@ -321,8 +325,7 @@ def parse_user_status(payload):
   status = proto_fields(payload)
   plan_status = message(status, 13)
   plan = message(plan_status, 1)
-  devin_info = message(plan, 33)
-  tier = text(devin_info, 2) or text(plan, 2) or TEAMS_TIER.get(varint(plan, 1)) or TEAMS_TIER.get(varint(status, 10)) or ""
+  tier = text(plan, 2) or TEAMS_TIER.get(varint(plan, 1)) or TEAMS_TIER.get(varint(status, 10)) or ""
 
   limits = []
   if plan_status:
@@ -451,7 +454,7 @@ def read_quota():
 # ------------------------------------------------------------------ record
 
 
-def build_record(stats):
+def build_record(stats, unreadable):
   quota = read_quota()
   signed_in = credentials_path().is_file()
   in_use = number(stats.get("totalPrompts")) > 0 or bool(stats.get("modelUsage"))
@@ -465,6 +468,12 @@ def build_record(stats):
   elif in_use:
     record["usageStatusText"] = "Waiting for auth"
     record["authHelpText"] = AUTH_HELP
+  elif unreadable:
+    # Nothing else to say, and a database that can't be read is trouble the
+    # panel shows rather than a Devin it hides as unused.
+    record["ready"] = True
+    record["usageStatusText"] = "Devin unavailable"
+    record["authHelpText"] = "Couldn't read Devin's session database (" + "; ".join(map(str, unreadable)) + ")."
   record.update(stats)
   return record
 
@@ -475,8 +484,10 @@ def main():
   parser.add_argument("--limits-only", action="store_true", help="reuse a recent local scan")
   args = parser.parse_args()
 
-  stats = cached_scan(AGENT_ID, scan_sources(), scan_max_age(args.force, args.limits_only), run_local_scans)
-  emit(build_record(stats), sort_keys=True)
+  # A scan served from the cache read every database.
+  unreadable = []
+  stats = cached_scan(AGENT_ID, scan_sources(), scan_max_age(args.force, args.limits_only), lambda: run_local_scans(unreadable))
+  emit(build_record(stats, unreadable), sort_keys=True)
   return 0
 
 

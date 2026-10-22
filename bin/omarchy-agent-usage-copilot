@@ -56,6 +56,7 @@ from typing import Any
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.environ["OMARCHY_PATH"], "shell", "plugins", "agents"))
 from collectors import (  # noqa: E402
+  NUMBER_CEILING,
   HttpError,
   LimitsCache,
   Stats,
@@ -118,11 +119,14 @@ def next_month_start(now: dt.datetime) -> dt.datetime:
 
 
 def positive_float(value: Any) -> float:
+  """A cost from disk, 0.0 when it can't be trusted: like number(), an
+  infinite or huge figure is a damaged field, not spend that fills the
+  allowance on its own."""
   try:
     n = float(value or 0)
-  except (TypeError, ValueError):
+  except (TypeError, ValueError, OverflowError):
     return 0.0
-  return n if n > 0 else 0.0
+  return n if math.isfinite(n) and 0 < n < NUMBER_CEILING else 0.0
 
 
 def credits_from_nano(nano: Any) -> float:
@@ -157,29 +161,35 @@ def parse_event_time(value: Any) -> dt.datetime | None:
   """Parse a store or transcript timestamp into timezone-aware local time.
 
   Accepts ISO-8601 (with or without Z) and epoch seconds or milliseconds.
-  Everything else collapses to None; the caller falls back to the local date.
+  As in local_day(), zero, a huge or negative number, NaN, a boolean, a date
+  outside 2000-2100, and anything else collapse to None; the caller falls
+  back to the file's time or the local date.
   """
-  if value is None:
+  if isinstance(value, str):
+    value = value.strip()
+    if value.isdigit():
+      # ASCII digits only, and few enough to be a time: isdigit() also passes
+      # other scripts' digits and int() refuses strings past 4300 digits.
+      value = int(value) if value.isascii() and len(value) <= 20 else None
+  if value is None or value == "" or isinstance(value, bool):
     return None
   if isinstance(value, (int, float)):
+    if number(value) <= 0:
+      return None
+    seconds = value / 1000 if value > 10_000_000_000 else value
     try:
-      seconds = (
-        float(value) / 1000.0 if float(value) > 10_000_000_000 else float(value)
-      )
-      return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).astimezone()
+      parsed = dt.datetime.fromtimestamp(seconds, dt.timezone.utc)
     except (OverflowError, OSError, ValueError):
       return None
-  raw = str(value).strip()
-  if not raw:
+  else:
+    try:
+      parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+      return None
+    if parsed.tzinfo is None:
+      parsed = parsed.replace(tzinfo=dt.timezone.utc)
+  if not 2000 <= parsed.year <= 2100:
     return None
-  if raw.isdigit():
-    return parse_event_time(int(raw))
-  try:
-    parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-  except ValueError:
-    return None
-  if parsed.tzinfo is None:
-    parsed = parsed.replace(tzinfo=dt.timezone.utc)
   return parsed.astimezone()
 
 
@@ -272,14 +282,38 @@ class UsageTally(Stats):
 # total_nano_aiu. Rows stream through the tally rather than being fetched, so
 # lifetime totals cover the whole store at constant memory. A row with no time
 # is today's, and one whose time can't be trusted counts nowhere.
+#
+# Current CLIs also say who started each request: initiator "user" is a
+# prompt typed into the session, and "agent" the follow-up calls the agent
+# made on its own (a tool loop's next step, a subagent). And a request GitHub
+# served carries GitHub's usage report, its copilot_usage_model and cost; one
+# sent to a custom provider (BYOK, COPILOT_PROVIDER_BASE_URL) has neither, so
+# that provider billed it, not Copilot, and it stays out of this record. The
+# store doesn't keep where such a request went. A store from before these
+# columns counts every row as Copilot's, and its prompts can't be told apart.
 
 
-def scan_store(conn: sqlite3.Connection) -> dict[str, Any]:
+def table_columns(conn: sqlite3.Connection, name: str) -> set[str]:
+  try:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({name})")}
+  except sqlite3.Error:
+    return set()
+
+
+# The stats, and how many dated rows the store held: a store with none falls
+# back on the transcripts.
+def scan_store(conn: sqlite3.Connection) -> tuple[dict[str, Any], int]:
   tally = UsageTally()
+  rows_seen = 0
+  columns = table_columns(conn, "assistant_usage_events")
+  knows_initiator = "initiator" in columns
+  knows_billing = "copilot_usage_model" in columns
+  optional = [name for name in ("initiator", "agent_id", "copilot_usage_model") if name in columns]
+  extra = "".join(", " + name for name in optional)
   try:
     rows = conn.execute(
       "SELECT session_id, model, created_at, total_nano_aiu, input_tokens,"
-      " output_tokens, cache_read_tokens, cache_write_tokens"
+      " output_tokens, cache_read_tokens, cache_write_tokens" + extra +
       " FROM assistant_usage_events"
     )
     for row in rows:
@@ -287,7 +321,14 @@ def scan_store(conn: sqlite3.Connection) -> dict[str, Any]:
       day = local_day(row["created_at"])
       if day is None:
         continue
-      tally.add_prompts(day, session_id or "unknown")
+      rows_seen += 1
+      if knows_billing and row["copilot_usage_model"] is None and row["total_nano_aiu"] is None:
+        continue
+      if knows_initiator:
+        typed = clean_name(row["initiator"]) == "user" and not ("agent_id" in optional and clean_name(row["agent_id"]))
+        tally.add_prompts(day, session_id or "unknown", 1 if typed else 0)
+      else:
+        tally.add_prompts(day, session_id or "unknown")
       tally.spend(
         utc_month_key(row["created_at"]),
         credits_from_nano(row["total_nano_aiu"]),
@@ -303,10 +344,10 @@ def scan_store(conn: sqlite3.Connection) -> dict[str, Any]:
         ),
       )
   except sqlite3.Error:
-    return blank_stats()
-  # A row is a billed model request, and one prompt can make many, so its
-  # count stays out of the panel's prompt totals.
-  return dict(tally.stats(), hasPromptStats=False)
+    return blank_stats(), 0
+  # Without an initiator a row is a billed model request, and one prompt can
+  # make many, so its count stays out of the panel's prompt totals.
+  return dict(tally.stats(), hasPromptStats=knows_initiator), rows_seen
 
 
 # ------------------------------------------------------ transcript fallback
@@ -432,7 +473,12 @@ def scan_transcript(event_file: Path, session_key: str, tally: UsageTally) -> No
       if not isinstance(data, dict):
         continue
 
-      parsed = parse_event_time(entry.get("timestamp"))
+      # A line with no time is the file's; one whose time can't be trusted
+      # counts nowhere, as in every other collector.
+      stamped = entry.get("timestamp")
+      parsed = parse_event_time(stamped)
+      if parsed is None and stamped is not None:
+        continue
       if parsed is None and session_mtime > 0:
         parsed = dt.datetime.fromtimestamp(
           session_mtime, dt.timezone.utc
@@ -506,8 +552,8 @@ def direct_scan(home_dir: Path) -> tuple[dict[str, Any], bool]:
     return stats, complete and not store.exists()
   try:
     if has_table(conn, "assistant_usage_events"):
-      stats = scan_store(conn)
-      if number(stats.get("totalPrompts")) > 0:
+      stats, rows_seen = scan_store(conn)
+      if rows_seen:
         return stats, True
     # A store without the usage table, or one that is still empty, falls back
     # to the transcripts exactly like a store-less machine.
@@ -638,13 +684,25 @@ def ask_quota(token: str) -> dict[str, Any]:
     return {"available": False, "reason": "no-quota"}
 
   # Under token-based billing the snapshot counts AI credits directly; only
-  # the local store and transcripts count in nano units. A limited allowance
-  # needs both amounts: one missing or unreadable would pass for no meter or
-  # an untouched allowance and replace the last good answer, so it is a
-  # failed check instead.
+  # the local store and transcripts count in nano units. GitHub's snapshot
+  # (the CLI's CopilotUserResponseQuotaSnapshotsPremiumInteractions) says
+  # what is left, as remaining, quota_remaining or percent_remaining, so the
+  # amount used is the entitlement less that; a credits_used amount is still
+  # read first where one is sent. A limited allowance needs both amounts: one
+  # missing or unreadable would pass for no meter or an untouched allowance
+  # and replace the last good answer, so it is a failed check instead.
   unlimited = snapshot.get("unlimited") is True
   entitlement = quota_amount(snapshot.get("entitlement"))
   used = quota_amount(snapshot.get("credits_used"))
+  if used is None and entitlement is not None:
+    remaining = quota_amount(snapshot.get("remaining"))
+    if remaining is None:
+      remaining = quota_amount(snapshot.get("quota_remaining"))
+    percent_remaining = quota_amount(snapshot.get("percent_remaining"))
+    if remaining is not None:
+      used = max(0.0, entitlement - remaining)
+    elif percent_remaining is not None:
+      used = entitlement * max(0.0, 100.0 - percent_remaining) / 100.0
   if not unlimited and (entitlement is None or used is None):
     return {"available": False, "reason": "bad-payload"}
   return {

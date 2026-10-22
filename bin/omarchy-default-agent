@@ -89,12 +89,18 @@ if [[ -n ${agent_installer:-} ]]; then
   agent_present() { "$agent_installer" --check; }
   agent_install() { "$agent_installer" --now; }
 else
+  # omarchy-mise-install's wrappers run `mise use` and `mise x`, current ones on
+  # lines of their own and older ones after an inline variable; either way
+  # running one installs the tool it wraps. A symlink is the user's own install.
+  mise_wrapper() {
+    [[ ! -L $1 ]] && head -c 4096 "$1" | grep -qaE 'mise (use|x) '
+  }
+
   # Anything at the wrapper's path other than the wrapper is the user's own
   # install, such as the symlink Cursor's installer leaves. A mise copy would
   # only shadow it, since the mise shims precede ~/.local/bin on PATH.
   user_install() {
-    [[ -x $HOME/.local/bin/$agent ]] &&
-      { [[ -L $HOME/.local/bin/$agent ]] || ! grep -q '^mise use -g' "$HOME/.local/bin/$agent"; }
+    [[ -x $HOME/.local/bin/$agent ]] && ! mise_wrapper "$HOME/.local/bin/$agent"
   }
   agent_present() { user_install || mise where "$agent_tool" &>/dev/null; }
   # Omarchy declares the default agents as mise tools, so installing one is
@@ -103,7 +109,13 @@ else
   agent_install() {
     user_install && return
     if omarchy-mise-default-tools declares "$agent_tool"; then
-      mise install "$agent_tool"
+      # An npm-backed agent needs node, itself a lazy tool, and mise won't
+      # install it as the agent's dependency on a machine without it yet.
+      if [[ $(mise tool "$agent_tool" --backend 2>/dev/null) == npm:* ]]; then
+        mise install node "$agent_tool"
+      else
+        mise install "$agent_tool"
+      fi
     elif [[ ${agent_prereleases:-} == "true" ]]; then
       MISE_PRERELEASES=true mise use -g "$agent_package"
     else

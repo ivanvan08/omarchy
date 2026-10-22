@@ -76,6 +76,10 @@ check(
   "local_day skips a damaged stamp dated before 2000 or after 2100",
   [collectors.local_day(value) for value in (1, 86400, "1999-12-31T12:00:00", "2102-06-01T00:00:00Z")] == [None] * 4,
 )
+check(
+  "local_day skips digit strings that aren't a time: other scripts' digits and thousands of digits",
+  [collectors.local_day(value) for value in ("\u0661\u0667\u0660\u0660\u0660\u0660\u0660\u0660\u0660\u0660", "9" * 5000)] == [None] * 2,
+)
 check("local_day reads epoch milliseconds, seconds, and digit strings alike", len({
   collectors.local_day(1_700_000_000_000),
   collectors.local_day(1_700_000_000),
@@ -339,12 +343,31 @@ check(
 )
 older.save([], balance={"remaining": 2})
 check("a plain save replaces whatever was kept", json.loads(credits.path.read_text())["balance"] == {"remaining": 2})
+ahead = json.loads(credits.path.read_text())
+ahead["fetchedAtMs"] = collectors.now_ms() + 3_600_000
+credits.path.write_text(json.dumps(ahead))
+older.save([], only_if_newer=True, balance={"remaining": 3})
+check(
+  "a stamp an hour ahead, from before the clock went back, is replaced by an answer saved only if newer",
+  json.loads(credits.path.read_text())["balance"] == {"remaining": 3},
+)
 named = collectors.LimitsCache.at(collectors.cache_root() / "demo-limits.json")
 named.save([{"label": "Weekly", "percent": 0.1, "resetsAt": future}])
 check(
   "a cache opened at a name of its own keeps and reads like any other",
   named.path.name == "demo-limits.json" and named.lock_path.name == "demo-limits.lock"
   and collectors.LimitsCache.at(named.path).fresh(False) and collectors.LimitsCache.at(named.path).limits == named.limits,
+)
+
+import io  # noqa: E402
+
+printed = io.StringIO()
+with contextlib.redirect_stdout(printed):
+  collectors.emit({"balance": {"remaining": float("inf"), "spent": [float("nan"), 1.5]}, "ready": True})
+check(
+  "emit prints a number that overflowed as 0, so the record stays JSON the panel can parse",
+  json.loads(printed.getvalue()) == {"balance": {"remaining": 0, "spent": [0, 1.5]}, "ready": True},
+  printed.getvalue(),
 )
 
 # ------------------------------------------------------------------- http
@@ -376,6 +399,7 @@ check("open_json returns the JSON answer", outcome(lambda request, timeout=None:
 check("an HTTP status is a refusal, not a transport failure", outcome(failing(urllib.error.HTTPError("u", 401, "no", {}, None))) == (401, False, False))
 check("no route, no DNS, and a timeout are transport failures", {outcome(failing(error)) for error in (urllib.error.URLError("no route"), TimeoutError("slow"), ConnectionResetError())} == {(0, True, False)})
 check("a body that isn't JSON is an invalid answer", outcome(lambda request, timeout=None: io.BytesIO(b"<html>")) == (0, False, True))
+check("a body nested deeper than the parser goes is an invalid answer", outcome(lambda request, timeout=None: io.BytesIO(b"[" * 200_000)) == (0, False, True))
 
 import http.client  # noqa: E402
 
@@ -434,6 +458,51 @@ try:
 except collectors.HttpError as error:
   short = error
 check("a body short of its Content-Length over a socket is cut short", short is not None and (short.transport, short.invalid, short.cut_short) == (False, True, True), repr(short and vars(short)))
+
+
+def drip_server():
+  listener = socket.socket()
+  listener.bind(("127.0.0.1", 0))
+  listener.listen(1)
+
+  def serve():
+    conn, _ = listener.accept()
+    with conn:
+      conn.recv(65536)
+      conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n')
+      with contextlib.suppress(OSError):
+        for _ in range(100):
+          conn.sendall(b" ")
+          time.sleep(0.1)
+    listener.close()
+
+  threading.Thread(target=serve, daemon=True).start()
+  return f"http://127.0.0.1:{listener.getsockname()[1]}/"
+
+
+began = time.monotonic()
+try:
+  collectors.open_json(urllib.request.Request(drip_server()), timeout=0.3)
+  dripped = None
+except collectors.HttpError as error:
+  dripped = error
+check(
+  "a reply dripping a byte at a time runs out of time as one cut short instead of holding the collector",
+  dripped is not None and dripped.cut_short and not dripped.transport and time.monotonic() - began < 5,
+  repr(dripped and vars(dripped)),
+)
+bad_key = urllib.request.Request("https://example.invalid", headers={"Authorization": "Bearer sk-secret\nX: y"})
+urllib.request.urlopen = real_urlopen
+try:
+  collectors.open_json(bad_key)
+  header = None
+except collectors.HttpError as error:
+  header = error
+check(
+  "a key http.client won't send is an invalid answer that doesn't quote the key",
+  header is not None and header.invalid and header.__cause__ is None and header.__suppress_context__ and "sk-secret" not in str(header),
+  repr(header),
+)
 check(
   "a credential goes over HTTPS, or plain HTTP to loopback, and never to a URL with credentials in it",
   [collectors.trusted_endpoint(url) for url in ("https://example.com/x", "http://127.0.0.1:9/x", "http://localhost/x", "http://[::1]:9/x",
@@ -488,6 +557,21 @@ os.environ["PI_CODING_AGENT_DIR"] = str(home / ".pi" / "agent")
 check("an override that aliases a default root is read once", collectors.pi_session_roots().count(sessions.resolve()) == 1)
 os.environ.pop("PI_CODING_AGENT_DIR")
 
+# pi's SettingsManager.getSessionDir() reads `sessionDir` from the agent
+# tree's settings.json, expanding a leading ~, and new sessions go there.
+(home / ".pi" / "agent").mkdir(parents=True, exist_ok=True)
+(home / ".pi" / "agent" / "settings.json").write_text(json.dumps({"sessionDir": "~/pi-sessions"}))
+(home / ".omp" / "profiles" / "work" / "agent").mkdir(parents=True, exist_ok=True)
+(home / ".omp" / "profiles" / "work" / "agent" / "settings.json").write_text(json.dumps({"sessionDir": "relative/sessions"}))
+roots = collectors.pi_session_roots()
+check(
+  "a settings.json sessionDir is read as a root, a relative one skipped",
+  (home / "pi-sessions").resolve() in roots and not any(root.name == "sessions" and root.parent.name == "relative" for root in roots),
+  "\n".join(map(str, roots)),
+)
+(home / ".pi" / "agent" / "settings.json").unlink()
+(home / ".omp" / "profiles" / "work" / "agent" / "settings.json").unlink()
+
 parent = sessions / "p" / "parent.jsonl"
 write_session(parent, [
   reply("demo", 100, "m1"),
@@ -511,11 +595,79 @@ by_tokens = sorted(row.input_tokens + row.output_tokens + row.cache_read + row.c
 check("a scan that read everything says so", complete)
 check(
   "pi replies count once by (id, timestamp), id-less lines always, with totals, thinking, and garbage handled",
-  by_tokens == [1, 1, 10, 20, 40, 100, 1000],
+  by_tokens == [1, 1, 10, 16, 40, 100, 1000],
   json.dumps([row._asdict() for row in rows]),
 )
 reasoning = next(row for row in rows if row.input_tokens == 2)
-check("thinking tokens count as output", (reasoning.output_tokens, reasoning.cache_read, reasoning.cache_write) == (7, 5, 6))
+check("thinking is already in output and never added again", (reasoning.output_tokens, reasoning.cache_read, reasoning.cache_write) == (3, 5, 6))
+# As pi 1.4.0 and omp 18.12.6 wrote them for a reply the server billed as 54
+# and 84 completion tokens, 7 and 37 of them reasoning: totalTokens leaves the
+# thinking out because output already holds it.
+thinking = work / "thinking" / "sessions"
+write_session(thinking / "pi.jsonl", [reply("demo", 0, "pi1", usage={"input": 1401, "output": 54, "cacheRead": 74, "cacheWrite": 0, "reasoning": 7, "totalTokens": 1529})])
+write_session(thinking / "omp.jsonl", [reply("demo", 0, "omp1", usage={"input": 4401, "output": 84, "cacheRead": 104, "cacheWrite": 0, "totalTokens": 4589, "reasoningTokens": 37})])
+thinking_rows, _ = collectors.scan_pi_sessions(r'"provider"\s*:\s*"demo"', lambda provider, model, entry: True, roots=[thinking])
+check(
+  "pi's and omp's output already holds their thinking",
+  sorted((row.output_tokens, row.input_tokens + row.output_tokens + row.cache_read) for row in thinking_rows) == [(54, 1529), (84, 4589)],
+  json.dumps([row._asdict() for row in thinking_rows]),
+)
+# pi 1.4.0 counts a compaction's and a branch summary's usage, a usage entry
+# (cache warming), and a tool's nested model work in the session's totals.
+# Only the usage entry names its provider; the rest ran on the session's
+# model, the last switch or reply before them, as pi wrote this compaction.
+summaries = work / "summaries" / "sessions"
+pi_switch = {"type": "model_change", "id": "mc1", "timestamp": stamp, "provider": "demo", "modelId": "demo-model"}
+compaction = {"type": "compaction", "id": "c1", "parentId": "x", "timestamp": stamp, "summary": "Mock reply 210.", "firstKeptEntryId": "x", "tokensBefore": 44000,
+              "usage": {"input": 44102, "output": 521, "cacheRead": 561, "cacheWrite": 0, "reasoning": 427, "totalTokens": 45184}, "fromHook": False}
+write_session(summaries / "pi.jsonl", [
+  pi_switch,
+  compaction,
+  {"type": "usage", "id": "u1", "timestamp": stamp, "kind": "cache_warm", "provider": "demo", "model": "warm-model", "usage": {"input": 0, "output": 0, "cacheRead": 500, "cacheWrite": 0, "totalTokens": 500}},
+  {"type": "usage", "id": "u2", "timestamp": stamp, "kind": "cache_warm", "provider": "other", "model": "warm-model", "usage": {"input": 9000}},
+  {"type": "message", "id": "t1", "timestamp": stamp, "message": {"role": "toolResult", "toolCallId": "call_1", "toolName": "agent", "content": [], "usage": {"input": 30, "output": 3}, "isError": False}},
+  {"type": "message", "id": "o1", "timestamp": stamp, "message": {"role": "assistant", "provider": "other", "model": "o", "usage": {"input": 9000}}},
+  {**compaction, "id": "c2", "usage": {"input": 9000}},
+])
+# omp names the model as provider/model; a branch summary after it bills it,
+# one before any switch or reply bills nobody this reader can name.
+write_session(summaries / "omp.jsonl", [
+  {"type": "branch_summary", "id": "b0", "timestamp": stamp, "fromId": "x", "summary": "s", "usage": {"input": 9000}},
+  {"type": "model_change", "id": "mc2", "timestamp": stamp, "model": "demo/omp-model"},
+  {"type": "branch_summary", "id": "b1", "timestamp": stamp, "fromId": "x", "summary": "s", "usage": {"input": 70, "output": 7}},
+])
+summary_rows, _ = collectors.scan_pi_sessions(r'"provider"\s*:\s*"(demo|other)"', lambda provider, model, entry: provider == "demo", roots=[summaries])
+check(
+  "summaries, usage entries, and nested tool usage count under the model the session was on, answering no prompt",
+  sorted((row.model, row.input_tokens + row.output_tokens + row.cache_read, row.prompts) for row in summary_rows)
+  == [("demo-model", 33, 0), ("demo-model", 45184, 0), ("omp-model", 77, 0), ("warm-model", 500, 0)],
+  json.dumps([row._asdict() for row in summary_rows]),
+)
+# A prompt is a typed user message, booked on the first reply answering it,
+# as pi 1.4.0 wrote one that called a tool: the step after the tool result
+# answers no new prompt. omp marks the user messages it writes itself (a
+# handoff) as the agent's, and a prompt another provider answered is not
+# this one's.
+turns = work / "turns" / "sessions"
+write_session(turns / "pi.jsonl", [
+  {"type": "model_change", "id": "mc", "timestamp": stamp, "provider": "demo", "modelId": "m"},
+  {"type": "message", "id": "sys", "timestamp": stamp, "message": {"role": "system", "content": "", "timestamp": 1}},
+  {"type": "message", "id": "u1", "timestamp": stamp, "message": {"role": "user", "content": [{"type": "text", "text": "Use the tool"}], "timestamp": 1}},
+  reply("demo", 0, "step1", usage={"input": 21401, "output": 47, "cacheRead": 274, "cacheWrite": 0, "totalTokens": 21722}),
+  {"type": "message", "id": "tr", "timestamp": stamp, "message": {"role": "toolResult", "toolCallId": "call_1", "toolName": "bash", "content": [{"type": "text", "text": "ok"}], "isError": False}},
+  reply("demo", 0, "step2", usage={"input": 21501, "output": 47, "cacheRead": 275, "cacheWrite": 0, "totalTokens": 21823}),
+  {"type": "message", "id": "u2", "timestamp": stamp, "message": {"role": "user", "content": "Ask the other one", "timestamp": 2}},
+  reply("other", 0, "o1", usage={"input": 9000}),
+  {"type": "message", "id": "u3", "timestamp": stamp, "message": {"role": "user", "content": [{"type": "text", "text": "handoff"}], "attribution": "agent"}},
+  reply("demo", 0, "step3", usage={"input": 5}),
+])
+turn_rows, _ = collectors.scan_pi_sessions(r'"provider"\s*:\s*"(demo|other)"', lambda provider, model, entry: provider == "demo", roots=[turns])
+check(
+  "a typed prompt books on its first reply, not on a tool step, a handoff, or another provider's reply",
+  sorted((row.input_tokens, row.prompts) for row in turn_rows) == [(5, 0), (21401, 1), (21501, 0)],
+  json.dumps([row._asdict() for row in turn_rows]),
+)
+check("a session without user messages keeps a prompt per reply", all(row.prompts == 1 for row in thinking_rows))
 check("a forked message counts toward the session it was forked from", next(row for row in rows if row.input_tokens == 100).session == os.path.realpath(parent))
 check("a fork that only copied its parent is no session of its own", os.path.realpath(sessions / "a" / "copy-only.jsonl") not in {row.session for row in rows})
 check("the provider filter is the caller's", all(row.provider == "demo" for row in rows))
@@ -568,7 +720,7 @@ check("a collector can read a pi-format tree of its own instead", own_complete a
 both_rows, _ = collectors.scan_pi_sessions(r'"provider"\s*:\s*"demo"', lambda provider, model, entry: True, roots=[*collectors.pi_session_roots(), harness, work / "alias", work / "missing"])
 check(
   "roots read beside pi's count a message copied between them once, an alias once, and a missing one as nothing",
-  sorted(row.input_tokens + row.output_tokens + row.cache_read + row.cache_write for row in both_rows) == [1, 1, 10, 20, 40, 100, 300, 1000],
+  sorted(row.input_tokens + row.output_tokens + row.cache_read + row.cache_write for row in both_rows) == [1, 1, 10, 16, 40, 100, 300, 1000],
   json.dumps([row._asdict() for row in both_rows]),
 )
 check("canonical roots drop an alias and a root inside another", collectors.canonical_roots([harness, work / "alias", harness / "inner", work / "harness"]) == [(work / "harness").resolve()])
@@ -717,6 +869,168 @@ check(
   json.dumps([row._asdict() for row in rows]),
 )
 
+# A prompt is a typed user message, so of the steps answering one, as
+# opencode 1.19.3 writes them (the same parentID), the first books it. A
+# compaction's summary answers the marker opencode adds, and a subagent's
+# session holds the model's prompts, not typed ones. V2 keeps a prompt as a
+# `user` row without a model, booked on the first reply after it.
+turns_db = work / "turns.db"
+conn = sqlite3.connect(turns_db)
+conn.execute("CREATE TABLE session (id text PRIMARY KEY, parent_id text, time_created integer NOT NULL)")
+conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+conn.execute("CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,"
+             " seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+conn.executemany("INSERT INTO session VALUES (?, ?, ?)", [("ses_tool", None, fork_ms), ("ses_task", "ses_tool", fork_ms)])
+
+
+def step(parent, input_tokens, created, **extra):
+  return json.dumps({"parentID": parent, "role": "assistant", "mode": "build", "agent": "build", "cost": 0, "modelID": "oc-tooltest", "providerID": "demo",
+                     "tokens": {"total": input_tokens, "input": input_tokens, "output": 0, "reasoning": 0, "cache": {"write": 0, "read": 0}},
+                     "time": {"created": created, "completed": created + 1}, **extra})
+
+
+conn.executemany("INSERT INTO message VALUES (?, ?, ?, ?, ?)", [
+  ("msg_u1", "ses_tool", now_ms, now_ms, json.dumps({"role": "user", "time": {"created": now_ms}, "agent": "build", "model": {"providerID": "demo", "modelID": "oc-tooltest"}})),
+  ("msg_a2", "ses_tool", now_ms + 2, now_ms + 2, step("msg_u1", 21501, now_ms + 2, finish="stop")),
+  ("msg_a1", "ses_tool", now_ms + 1, now_ms + 1, step("msg_u1", 21401, now_ms + 1, finish="tool-calls")),
+  ("msg_u2", "ses_tool", now_ms + 3, now_ms + 3, json.dumps({"role": "user", "time": {"created": now_ms + 3}, "model": {"providerID": "demo", "modelID": "oc-tooltest"}})),
+  ("msg_c1", "ses_tool", now_ms + 4, now_ms + 4, step("msg_u2", 23153, now_ms + 4, mode="compaction", agent="compaction", summary=True)),
+  ("msg_t1", "ses_task", now_ms + 5, now_ms + 5, step("msg_tu", 300, now_ms + 5)),
+])
+conn.executemany("INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)", [
+  ("v2_u1", "ses_v2", "user", 1, now_ms, now_ms, json.dumps({"text": "hi", "time": {"created": now_ms}})),
+  ("v2_a1", "ses_v2", "assistant", 2, now_ms, now_ms, v2("demo", {"input": 11})),
+  ("v2_a2", "ses_v2", "assistant", 3, now_ms, now_ms, v2("demo", {"input": 12})),
+  ("v2_c1", "ses_v2", "compaction", 4, now_ms, now_ms, v2("demo", {"input": 13})),
+  ("v2_lone", "ses_v2_lone", "assistant", 1, now_ms, now_ms, v2("demo", {"input": 14})),
+])
+conn.commit()
+conn.close()
+os.environ["OPENCODE_DB"] = str(turns_db)
+rows, complete = collectors.scan_opencode(["demo"], accept_demo)
+os.environ.pop("OPENCODE_DB")
+check(
+  "an opencode prompt books on its first step, never on a later one, a compaction, or a subagent's",
+  complete and sorted((row.input_tokens, row.prompts) for row in rows) == [(11, 1), (12, 0), (13, 0), (14, 1), (300, 0), (21401, 1), (21501, 0), (23153, 0)],
+  json.dumps([row._asdict() for row in rows]),
+)
+
+# ------------------------------------------------------------- endpoints
+
+# A base URL's host says who bills what it serves: a provider's own host or
+# a subdomain of it, the user's own hardware, or nothing that can be placed.
+for url, owner in (
+  ("https://api.z.ai/api/anthropic", "zai"),
+  ("https://open.bigmodel.cn/api/anthropic", "zai"),
+  ("https://ollama.com", "ollama"),
+  ("https://api.minimax.io/anthropic", "minimax"),
+  ("https://api.minimaxi.com/anthropic", "minimax"),
+  ("https://api.deepseek.com/anthropic", "deepseek"),
+  ("https://api.kimi.com/coding/", "kimi"),
+  ("https://api.moonshot.ai/anthropic", "kimi"),
+  ("https://openrouter.ai/api", "openrouter"),
+  ("https://eu.openrouter.ai/api", "openrouter"),
+  ("http://localhost:11434", "local"),
+  ("http://127.0.0.1:4000", "local"),
+  ("http://192.168.1.20:8080/v1", "local"),
+  ("http://gpu-box:11434", "local"),
+  ("http://studio.lan:1234/v1", "local"),
+  ("https://llm-proxy.example.com/anthropic", ""),
+  ("https://notapi.z.ai.example.com", ""),
+  ("", ""),
+  ("http://[::1", ""),
+):
+  check(f"the endpoint {url!r} is billed by {owner or 'nobody here'}", collectors.endpoint_owner(url) == owner, collectors.endpoint_owner(url))
+
+# Claude Code's replies, by the model that answered and where Claude Code is
+# sent: the one rule every collector reading its transcripts applies.
+CLAUDE_CODE_OWNERS = {
+  "": {"claude-sonnet-4-5": "claude", None: "claude", "glm-4.6": "zai", "GLM-4.5-Air": "zai", "glm-4.6:cloud": "ollama",
+       "gpt-oss:120b-cloud": "ollama", "MiniMax-M2": "minimax", "deepseek-chat": "deepseek", "kimi-k2-0905": "kimi",
+       "moonshot-v1-8k": "kimi", "qwen3-coder": None, "<synthetic>": None},
+  "https://api.anthropic.com": {"claude-sonnet-4-5": "claude", "glm-4.6": "zai"},
+  "https://api.z.ai/api/anthropic": {"claude-sonnet-4-5": "zai", None: "zai", "glm-4.6": "zai", "glm-4.6:cloud": "zai"},
+  "https://ollama.com": {"claude-sonnet-4-5": "ollama", "kimi-k2.7-code:cloud": "ollama", "glm-4.6": "ollama"},
+  "https://openrouter.ai/api": {"claude-sonnet-4-5": "openrouter", "anthropic/claude-sonnet-4.5": "openrouter", None: "openrouter"},
+  "https://api.minimax.io/anthropic": {"MiniMax-M2": "minimax", "claude-sonnet-4-5": "minimax"},
+  "https://api.deepseek.com/anthropic": {"deepseek-chat": "deepseek"},
+  "https://api.kimi.com/coding/": {"kimi-for-coding": "kimi", "claude-sonnet-4-5": "kimi"},
+  "http://localhost:11434": {"qwen3-coder": "local", "glm-4.6": "local", "deepseek-r1:8b": "local", "glm-4.6:cloud": "ollama",
+                             "claude-sonnet-4-5": "claude", None: "claude"},
+  "https://llm-proxy.example.com/anthropic": {"claude-sonnet-4-5": "claude", None: "claude", "glm-4.6": None, "qwen3-coder": None,
+                                              "gpt-oss:120b-cloud": "ollama"},
+}
+for url, models in CLAUDE_CODE_OWNERS.items():
+  got = {model: collectors.claude_code_owner(model, url) for model in models}
+  check(f"Claude Code replies sent to {url or 'Anthropic'} go to the collector that bills them", got == models, json.dumps({str(k): v for k, v in got.items()}))
+
+# The shared transcript reader hands each owner its replies once, typed
+# prompts apart from them, and the sessions in use; Stats books a row with no
+# tokens as its prompts alone.
+claude_home = home / "claude-code"
+transcripts = claude_home / "projects" / "demo"
+transcripts.mkdir(parents=True)
+
+
+def claude_reply(message_id, model, input_tokens, session="s1"):
+  return {"type": "assistant", "timestamp": stamp, "sessionId": session, "requestId": "r-" + message_id,
+          "message": {"id": message_id, "role": "assistant", "model": model, "usage": {"input_tokens": input_tokens, "output_tokens": 1}}}
+
+
+def claude_prompt(uuid, session="s1"):
+  return {"type": "user", "uuid": uuid, "timestamp": stamp, "sessionId": session, "message": {"role": "user", "content": "hi"}}
+
+
+lines = [claude_prompt("p1"), claude_reply("m1", "claude-sonnet-4-5", 100), claude_prompt("p2"), claude_reply("m2", "glm-4.6", 200),
+         claude_reply("m3", "glm-4.6", 300)]
+(transcripts / "s1.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+# A fork copies the GLM reply into a session of its own: counted once.
+(transcripts / "s2.jsonl").write_text(json.dumps({**claude_reply("m3", "glm-4.6", 300), "sessionId": "s2"}) + "\n")
+by_owner = {}
+for owner in ("claude", "zai", "ollama"):
+  owned = collectors.Stats()
+  for row in collectors.scan_claude_code(owner, claude_home / "projects", None, ""):
+    owned.add_row(row, row.model)
+  by_owner[owner] = owned.snapshot()
+check(
+  "the Claude Code reader splits replies and prompts between their owners, a copied reply once",
+  [(by_owner[o]["todayTotalTokens"], by_owner[o]["todayPrompts"], by_owner[o]["todaySessions"]) for o in ("claude", "zai", "ollama")]
+  == [(101, 1, 1), (502, 1, 2), (0, 0, 0)],
+  json.dumps(by_owner),
+)
+check(
+  "a scan of Claude Code is matched to the kind of endpoint it was made under, never the URL itself",
+  collectors.claude_code_endpoint("https://user:secret@llm-proxy.example.com") == "other"
+  and collectors.claude_code_endpoint("https://api.anthropic.com") == ""
+  and collectors.claude_code_endpoint("http://127.0.0.1:4000") == "local",
+)
+
+# MiniMax Code's routes: its own are MiniMax's, a custom provider its
+# config.yaml baseURL's (read without a YAML library: block mappings, quoted
+# and commented scalars), and one it no longer declares nobody's.
+mcode_home = home / "mcode"
+mcode_home.mkdir()
+(mcode_home / "config.yaml").write_text("""# written by mcode
+defaultModel: custom_provider:router/glm
+custom_provider:
+  router:
+    models:
+      - glm
+    options:
+      apiKey: "sk: placeholder"
+      baseURL: 'https://openrouter.ai/api/v1' # preset
+  box:
+    options:
+      baseURL: http://127.0.0.1:8080/v1
+  bare: {}
+""")
+routes = collectors.mcode_routes(mcode_home)
+check("MiniMax Code's custom providers are read from config.yaml by their baseURL's owner",
+      routes == {"router": "openrouter", "box": "local", "bare": ""}, json.dumps(routes))
+check("a MiniMax Code reply goes to its route's owner",
+      [collectors.mcode_route_owner(provider, routes) for provider in (None, "minimax_oauth", "custom_provider:router", "custom_provider:box", "custom_provider:bare", "custom_provider:gone", "zai")]
+      == ["minimax", "minimax", "openrouter", "local", None, None, None])
+
 # --------------------------------------------------------------- sign-ins
 
 import base64  # noqa: E402
@@ -742,7 +1056,7 @@ check("finite reads only finite numbers", [collectors.finite(value) for value in
 
 config = work / "config"
 os.environ["XDG_CONFIG_HOME"] = str(config)
-for name in ("CURSOR_API_KEY", "CURSOR_AUTH_PATH"):
+for name in ("CURSOR_API_KEY", "CURSOR_AUTH_PATH", "CURSOR_AUTH_TOKEN"):
   os.environ.pop(name, None)
 check("no Cursor sign-in anywhere is no token", collectors.cursor_token() == "")
 state_db = collectors.cursor_state_db()
@@ -766,7 +1080,15 @@ os.environ["CURSOR_AUTH_PATH"] = str(moved_auth)
 check("CURSOR_AUTH_PATH moves the CLI's sign-in", collectors.cursor_auth_path() == moved_auth and collectors.cursor_token() == "moved-key")
 check("an explicit auth path wins over CURSOR_AUTH_PATH", collectors.account_key(collectors.cursor_token(cli)) == "cli")
 os.environ["CURSOR_API_KEY"] = " exported "
-check("an exported key comes first", collectors.cursor_token() == "exported")
+check("an exported API key is never sent as a bearer, and with no token traded for it there is none",
+      collectors.cursor_token() == "")
+moved_auth.write_text(json.dumps({"accessToken": "traded-token", "apiKey": "exported"}))
+check("an exported API key stands for the token the CLI traded it for", collectors.cursor_token() == "traded-token")
+moved_auth.write_text(json.dumps({"accessToken": "traded-token", "apiKey": "another-key"}))
+check("a token traded for another key never stands for this one", collectors.cursor_token() == "")
+os.environ["CURSOR_AUTH_TOKEN"] = " direct "
+check("CURSOR_AUTH_TOKEN is a bearer as it stands, ahead of everything", collectors.cursor_token() == "direct")
+os.environ.pop("CURSOR_AUTH_TOKEN")
 check(
   "the editor's database is read without touching it",
   state_db.read_bytes() == state_db_bytes and sorted(path.name for path in state_db.parent.iterdir()) == ["state.vscdb"],
@@ -803,5 +1125,9 @@ check(
   and collectors.account_entry(dict(accounts[0], plan="Old"), dict(limits, live=True, retryAdvised=True), "Max")["plan"] == "Max"
   and collectors.account_entry(dict(accounts[0], plan="Old"), limits, "")["plan"] == "Old",
   json.dumps(entry),
+)
+check(
+  "an account whose check failed with nothing kept has no limits to call stale",
+  collectors.account_entry(accounts[1], dict(limits, limits=[]), "")["stale"] is False,
 )
 PY

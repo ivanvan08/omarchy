@@ -123,6 +123,68 @@ expect("Hermes reads HERMES_HOME and every named profile",
        [record["modelUsage"]["gpt-6-astra"]["inputTokens"], record["modelUsage"]["gpt-6-sol"]["inputTokens"], record["totalSessions"], record["totalPrompts"]],
        [100, 1000, 2, 2], record)
 
+# Hermes expands ~ and $VARs in HERMES_HOME, and a custom home at
+# <root>/profiles/<name> keeps its sibling profiles under <root>/profiles
+# (hermes_constants._hermes_root_of).
+sandbox()
+state_db(home() / "srv" / "profiles" / "work" / "state.db", ("gpt-6-astra", 100))
+state_db(home() / "srv" / "profiles" / "play" / "state.db", ("gpt-6-sol", 1000))
+os.environ["HERMES_ROOT_FOR_TEST"] = "srv"
+os.environ["HERMES_HOME"] = "~/$HERMES_ROOT_FOR_TEST/profiles/work"
+record = hermes()
+del os.environ["HERMES_HOME"], os.environ["HERMES_ROOT_FOR_TEST"]
+expect("Hermes expands HERMES_HOME and reads the profiles beside a custom profile home",
+       [record["modelUsage"].get("gpt-6-astra", {}).get("inputTokens"), record["modelUsage"].get("gpt-6-sol", {}).get("inputTokens"), record["totalSessions"]],
+       [100, 1000, 2], record)
+
+# A shell with a profile active exports HERMES_HOME=~/.hermes/profiles/<name>;
+# the root ~/.hermes is still the default profile, so it counts too
+# (hermes_cli.profiles.list_profiles), as with HERMES_HOME unset.
+sandbox()
+state_db(home() / ".hermes" / "state.db", ("gpt-6-astra", 100))
+state_db(home() / ".hermes" / "profiles" / "side" / "state.db", ("gpt-6-sol", 1000))
+os.environ["HERMES_HOME"] = str(home() / ".hermes" / "profiles" / "side")
+record = hermes()
+del os.environ["HERMES_HOME"]
+expect("Hermes reads the default profile beside an active named profile",
+       [record["modelUsage"].get("gpt-6-astra", {}).get("inputTokens"), record["modelUsage"].get("gpt-6-sol", {}).get("inputTokens"), record["totalSessions"]],
+       [100, 1000, 2], record)
+
+# The same holds for a custom root's profile home: <root>/state.db is its
+# default profile.
+sandbox()
+state_db(home() / "srv" / "state.db", ("gpt-6-astra", 100))
+state_db(home() / "srv" / "profiles" / "work" / "state.db", ("gpt-6-sol", 1000))
+os.environ["HERMES_HOME"] = str(home() / "srv" / "profiles" / "work")
+record = hermes()
+del os.environ["HERMES_HOME"]
+expect("Hermes reads a custom root's default profile beside its active profile",
+       [record["modelUsage"].get("gpt-6-astra", {}).get("inputTokens"), record["modelUsage"].get("gpt-6-sol", {}).get("inputTokens"), record["totalSessions"]],
+       [100, 1000, 2], record)
+
+# A custom root beside a used ~/.hermes: ~/.hermes is read whole, its own
+# state.db (its default profile) with its named profiles, not the profiles
+# alone.
+sandbox()
+state_db(home() / "custom-hermes" / "profiles" / "work" / "state.db", ("gpt-6-astra", 100))
+state_db(home() / ".hermes" / "state.db", ("gpt-6-sol", 1000))
+state_db(home() / ".hermes" / "profiles" / "side" / "state.db", ("gpt-6-luna", 10000))
+os.environ["HERMES_HOME"] = str(home() / "custom-hermes")
+record = hermes()
+del os.environ["HERMES_HOME"]
+expect("Hermes reads ~/.hermes whole beside a custom root",
+       [record["modelUsage"].get(model, {}).get("inputTokens") for model in ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")] + [record["totalSessions"]],
+       [100, 1000, 10000, 3], record)
+
+# HERMES_DATA_DIR_SUFFIX names the default home.
+sandbox()
+state_db(home() / ".hermes-beta" / "state.db", ("gpt-6-astra", 100))
+os.environ["HERMES_DATA_DIR_SUFFIX"] = "-beta"
+record = hermes()
+del os.environ["HERMES_DATA_DIR_SUFFIX"]
+expect("Hermes reads the default home HERMES_DATA_DIR_SUFFIX names",
+       record["modelUsage"].get("gpt-6-astra", {}).get("inputTokens"), 100, record)
+
 # A profile that is a link to the home is the home: counted once.
 sandbox()
 state_db(home() / ".hermes" / "state.db", ("gpt-6-astra", 100))
@@ -131,6 +193,54 @@ state_db(home() / ".hermes" / "state.db", ("gpt-6-astra", 100))
 record = hermes()
 expect("Hermes counts a profile linked to its home once",
        [record["modelUsage"]["gpt-6-astra"]["inputTokens"], record["totalSessions"], record["totalPrompts"]], [100, 1, 1], record)
+
+# A session counts where Hermes billed it: Nous Portal is Hermes', a server
+# you run the local collector's, and Anthropic's API (or a Claude model on a
+# local proxy), OpenRouter or a gateway nobody's here. A session Hermes kept
+# no route for goes where its first request did, else stays Hermes'. The rows
+# are shaped as Hermes Agent wrote them against a mock of each API.
+sandbox()
+db = home() / ".hermes" / "state.db"
+db.parent.mkdir(parents=True)
+conn = sqlite3.connect(db)
+conn.executescript("""
+CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, started_at REAL NOT NULL, billing_provider TEXT, billing_base_url TEXT, billing_mode TEXT);
+CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, timestamp REAL NOT NULL);
+CREATE TABLE session_model_usage (
+  session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT NOT NULL DEFAULT '', billing_base_url TEXT NOT NULL DEFAULT '',
+  billing_mode TEXT NOT NULL DEFAULT '', task TEXT NOT NULL DEFAULT '',
+  input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+);
+""")
+now = time.time()
+ROUTES = [
+  ("nous", "Hermes-4-405B", "nous", "https://inference-api.nousresearch.com/v1", 100),
+  ("custom", "hermes-mock-model", "custom", "http://127.0.0.1:18473/v1", 1000),
+  ("anthropic", "claude-mock-hermes", "anthropic", "http://127.0.0.1:18473", 10000),
+  ("router", "z-ai/glm-4.6", "openrouter", "https://openrouter.ai/api/v1", 100000),
+  ("gateway", "acme-1", "custom", "https://llm.acme.example/v1", 1000000),
+]
+for n, (session, model, provider, url, tokens) in enumerate(ROUTES):
+  conn.execute("INSERT INTO sessions VALUES (?, 'oneshot', ?, ?, ?, ?, NULL)", (session, model, now, provider, url))
+  conn.execute("INSERT INTO messages VALUES (?, ?, 'user', ?)", (n + 1, session, now))
+  conn.execute("INSERT INTO session_model_usage (session_id, model, billing_provider, billing_base_url, input_tokens) VALUES (?, ?, ?, ?, ?)", (session, model, provider, url, tokens))
+  # The session title is a request of its own, on the session's route.
+  conn.execute("INSERT INTO session_model_usage (session_id, model, billing_provider, billing_base_url, task, input_tokens) VALUES (?, ?, ?, ?, 'title_generation', ?)", (session, model, provider, url + "/", tokens))
+# A session whose route Hermes didn't keep, and one that never made a request.
+conn.execute("INSERT INTO sessions VALUES ('unrouted', 'oneshot', 'hermes-mock-model', ?, NULL, NULL, NULL)", (now,))
+conn.execute("INSERT INTO session_model_usage (session_id, model, billing_provider, billing_base_url, input_tokens) VALUES ('unrouted', 'hermes-mock-model', 'custom', 'http://127.0.0.1:18473/v1', 7)")
+conn.execute("INSERT INTO sessions VALUES ('failed', 'oneshot', 'claude-mock-hermes', ?, NULL, NULL, NULL)", (now,))
+conn.execute("INSERT INTO messages VALUES (99, 'failed', 'user', ?)", (now,))
+conn.commit()
+conn.close()
+record = hermes()
+expect("Hermes counts the sessions Nous Portal billed, and one it kept no route for",
+       [record["todayTokensByModel"], record["todayPrompts"], record["todaySessions"]], [{"Hermes-4-405B": 200}, 2, 2], record)
+local = collect("local", "--force")
+expect("Local counts the Hermes sessions a server you run answered",
+       [local["todayTokensByModel"], local["todayPrompts"], local["todaySessions"]], [{"hermes-mock-model": 2007}, 1, 2], local)
 
 # An unreadable state.db says Hermes is unavailable, naming it in the help
 # text, while the readable profiles still count, and that scan isn't cached.
@@ -166,6 +276,18 @@ conn.close()
 record = hermes()
 expect("Hermes emits every active date", [record["activeDays"], len(record["activeDates"])], [451, 451], record)
 expect("Hermes skips broken token counts, and counts an untimed session's in the totals", sorted(record["modelUsage"]), ["untimed"], record)
+
+# A start time outside 2000-2100 is a damaged stamp: the session counts, but
+# names no day.
+sandbox()
+db = state_db(home() / ".hermes" / "state.db")
+conn = sqlite3.connect(db)
+conn.executemany("INSERT INTO sessions VALUES (?, ?)", [("stray", 1), ("far", 12307334400)])
+conn.commit()
+conn.close()
+record = hermes()
+expect("a start time outside 2000-2100 names no active day",
+       [record["totalSessions"], record["activeDates"]], [3, [dt.date.today().isoformat()]], record)
 
 # ---------------------------------------------------------------- contract
 

@@ -31,11 +31,13 @@ from collectors import (  # noqa: E402
   base_record,
   cached_scan,
   emit,
+  kimchi_sessions_root,
   open_json,
   read_json,
   scan_max_age,
   scan_pi_sessions,
   stamp,
+  trusted_endpoint,
 )
 
 AGENT_ID = "kimchi"
@@ -44,6 +46,8 @@ AUTH_HELP = "Start Kimchi and log in, or set KIMCHI_API_KEY."
 REJECTED_HELP = "Kimchi rejected its API key. Log in again in Kimchi, or update KIMCHI_API_KEY."
 OUT_OF_CREDITS_HELP = "Kimchi's gateway is rate limiting requests until the account has credits again."
 REGION_LLM_BASE = {"us": "https://llm.kimchi.dev", "eu": "https://llm.eu.kimchi.dev"}
+# The region a self-hosted login saves; its gateway is the host it names.
+SELF_HOSTED = "self-hosted"
 PLAN_LABELS = {"community": "Community", "coder": "Coder", "teams": "Teams", "enterprise": "Enterprise"}
 BUDGET_LABELS = {
   "API_KEY": "API key budget",
@@ -81,19 +85,21 @@ def parse_time(value):
   return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-# The harness directory Kimchi keeps its sessions under: KIMCHI_CODING_AGENT_DIR
-# when set, as the CLI itself reads it, else ~/.config/kimchi/harness. Kimchi
-# has no profiles that move it.
-def harness_dir():
-  return Path(os.environ.get("KIMCHI_CODING_AGENT_DIR") or (Path.home() / ".config" / "kimchi" / "harness"))
+# Kimchi's own gateway routes, as its isKimchiProvider names them: kimchi-dev,
+# kimchi-dev/<upstream> and kimchi-experimental. `--provider` runs a session on
+# any other pi provider (OpenRouter, a custom one in harness/models.json),
+# which that provider bills: the openrouter collector reads these sessions for
+# its own, and a custom provider's count nowhere.
+def billed_here(provider, model, entry):
+  return provider in ("", "kimchi-dev", "kimchi-experimental") or provider.startswith("kimchi-dev/")
 
 
 # Every session file under <harness>/sessions, in pi's format, read the way
-# the shared reader reads pi's own: every assistant reply with usage counts,
-# whatever its provider, and a message a fork or resumed session repeats
-# counts once. Returns the stats and whether every source was read.
+# the shared reader reads pi's own: every assistant reply with usage on a
+# Kimchi route counts, and a message a fork or resumed session repeats counts
+# once. Returns the stats and whether every source was read.
 def local_stats(sessions_root):
-  rows, complete = scan_pi_sessions(r'"usage"', lambda provider, model, entry: True, [sessions_root])
+  rows, complete = scan_pi_sessions(r'"usage"', billed_here, [sessions_root])
   stats = Stats()
   for row in rows:
     stats.add_row(row, row.model or AGENT_ID)
@@ -102,14 +108,22 @@ def local_stats(sessions_root):
 
 # The key and gateway Kimchi itself would use: KIMCHI_API_KEY, KIMCHI_BASE_URL,
 # and KIMCHI_REGION over ~/.config/kimchi/config.json, the region's gateway
-# when nothing names one.
+# when nothing names one. A self-hosted login's gateway is <selfHostedUrl>/llm
+# (KIMCHI_SELF_HOSTED_URL over the saved one), and without one there is none:
+# its key is never sent to Kimchi's public gateway.
 def gateway():
   config = read_json(Path.home() / ".config" / "kimchi" / "config.json")
   key = os.environ.get("KIMCHI_API_KEY") or config.get("apiKey") or config.get("api_key") or ""
-  base = os.environ.get("KIMCHI_BASE_URL") or config.get("llmEndpoint") or ""
+  base = os.environ.get("KIMCHI_BASE_URL") or ""
+  region = next((value.strip().lower() for value in (os.environ.get("KIMCHI_REGION"), config.get("region"))
+                 if isinstance(value, str) and value.strip().lower() in (*REGION_LLM_BASE, SELF_HOSTED)), "us")
+  if not base and region == SELF_HOSTED:
+    self_hosted = os.environ.get("KIMCHI_SELF_HOSTED_URL") or config.get("selfHostedUrl") or ""
+    if not isinstance(self_hosted, str) or not self_hosted.strip():
+      return str(key).strip(), ""
+    base = self_hosted.strip().rstrip("/") + "/llm"
   if not base:
-    region = os.environ.get("KIMCHI_REGION") or config.get("region")
-    base = REGION_LLM_BASE.get(str(region or "").strip().lower(), REGION_LLM_BASE["us"])
+    base = config.get("llmEndpoint") or REGION_LLM_BASE[region]
   base = str(base).strip().rstrip("/")
   if base.lower().endswith("/openai/v1"):
     base = base[: -len("/openai/v1")]
@@ -254,6 +268,16 @@ def collect_billing(force):
   if not key:
     return result
   result["signedIn"] = True
+  if not base:
+    result["usageStatusText"] = "Balance unavailable"
+    result["authHelpText"] = "Kimchi is set to its self-hosted region but names no self-hosted URL. Local Kimchi stats are still shown."
+    return result
+  # KIMCHI_BASE_URL, llmEndpoint and a self-hosted URL move the gateway,
+  # never the key onto a connection anyone on the way can read.
+  if not trusted_endpoint(base):
+    result["usageStatusText"] = "Balance unavailable"
+    result["authHelpText"] = "Kimchi's gateway must use HTTPS (plain HTTP only for loopback). Local Kimchi stats are still shown."
+    return result
 
   parts = {}
   failed = set()
@@ -328,7 +352,7 @@ def main():
   # A scan is reused on the day it was made only, since one from before
   # midnight would count yesterday's sessions as today's. A limits-only
   # refresh needs fresh credits, not a fresh history scan.
-  sessions_root = harness_dir() / "sessions"
+  sessions_root = kimchi_sessions_root()
   stats = cached_scan(AGENT_ID, [sessions_root], scan_max_age(args.force, args.limits_only), lambda: local_stats(sessions_root))
   billing = collect_billing(args.force)
   signed_in = billing.pop("signedIn")

@@ -26,6 +26,12 @@ def use_home():
   os.environ["CODEX_HOME"] = str(home() / ".codex")
 
 
+# A machine that never ran a self-hosted model has no local stats to show.
+use_home()
+record = collect("local", "--force")
+expect("Local with no usage says it has no local stats", [record["ready"], record["hasLocalStats"]], [False, False], record)
+
+
 def rollouts():
   return Path(os.environ["CODEX_HOME"]) / "sessions" / datetime.now().strftime("%Y/%m/%d")
 
@@ -50,8 +56,18 @@ def rollout(name, *lines):
   return path
 
 
+# A prompt as Codex 0.163 writes it in a paginated rollout.
+def typed(text="hello"):
+  item = {"type": "UserMessage", "id": "u1", "content": [{"type": "text", "text": text, "text_elements": []}]}
+  return {"timestamp": STAMP, "type": "event_msg", "payload": {"type": "item_completed", "thread_id": "t1", "turn_id": "turn1", "item": item}}
+
+
+def context(model):
+  return {"timestamp": STAMP, "type": "turn_context", "payload": {"model": model}}
+
+
 def turn(name, provider, model):
-  return rollout(name, meta(provider), {"timestamp": STAMP, "type": "turn_context", "payload": {"model": model}}, token_count(1000))
+  return rollout(name, meta(provider), context(model), typed(), token_count(1000))
 
 
 def local_config(*providers):
@@ -91,15 +107,23 @@ rollout("fork", meta("openai"), meta("ollama"), {"timestamp": STAMP, "type": "tu
 
 local_record = collect("local")
 expect("Local counts Codex turns on LAN endpoints and known runtimes, nothing else", models(local_record), ["qwen-here", "qwen-net"], local_record)
-expect("Local counts a repeated Codex token_count once",
+expect("Local counts a repeated Codex token_count once, and each typed prompt once",
        [local_record["todayTotalTokens"], local_record["modelUsage"]["qwen-here"]["inputTokens"], local_record["todayPrompts"], local_record["ready"]],
-       [3300, 2000, 3, True], local_record)
+       [3300, 2000, 2, True], local_record)
 
 # The Local and Codex collectors split the rollouts between them: the
 # subscription's turns are Codex's alone, and no model shows in both.
 codex_record = collect("codex", "--force")
 expect("Codex keeps the subscription's own rollouts", models(codex_record), ["gpt-sub", "qwen-forked"], codex_record)
 expect("Local and Codex never count the same rollout", set(models(local_record)) & set(models(codex_record)), set())
+
+# The cloud-tagged turn Local leaves out is Ollama Cloud's, as Codex's `--oss`
+# wrote it: counted there once, with the prompt that asked for it.
+with FakeHttp():
+  ollama_record = collect("ollama", "--force")
+expect("Ollama counts the cloud-tagged Codex rollout Local leaves out",
+       [ollama_record["todayTokensByModel"], ollama_record["todayPrompts"], set(models(local_record)) & set(models(ollama_record))],
+       [{"gpt-oss": 1100}, 1, set()], ollama_record)
 
 # A rollout is replayed from the per-file cache while its size and mtime stand:
 # change its contents but neither, and the old count stays.
@@ -121,6 +145,15 @@ turn("mystery", "mystery", "qwen-custom")
 record = collect("local")
 expect("Local counts the providers local.json names", record["modelUsage"].get("qwen-custom", {}).get("inputTokens"), 1000, record)
 
+# A Codex config that isn't UTF-8 names no endpoints, like a missing one, and
+# the ones it named before stay remembered.
+config = Path(os.environ["CODEX_HOME"]) / "config.toml"
+saved = config.read_bytes()
+config.write_bytes(b'a = "\xff\xfe"\n')
+record = local()
+expect("Local reads past a Codex config that isn't UTF-8", models(record), ["qwen-custom", "qwen-here", "qwen-net"], record)
+config.write_bytes(saved)
+
 # A provider collector's id is never local, whatever local.json says.
 local_config("openrouter", "openai")
 record = collect("local")
@@ -139,6 +172,58 @@ with contextlib.redirect_stderr(io.StringIO()):
   record = collect("local")
 os.environ["XDG_CACHE_HOME"] = cache_home
 expect("Local still prints its record when the cache can't be written", models(record), ["qwen-here", "qwen-net"], record)
+
+# Prompts are the ones typed, not the requests answering them, each under the
+# model that answered it even when a legacy rollout writes it before the
+# turn_context: a tool call's two requests are one prompt, Codex's own context
+# and a subagent's messages are none, and a cloud model's prompt is no more
+# local than its tokens.
+use_home()
+rollout("paginated", meta("ollama"), context("qwen-tools"), typed("run ls"), token_count(1000),
+        {"timestamp": STAMP, "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "id": "c1"}}},
+        token_count(2000), context("gpt-oss:120b-cloud"), typed("now in the cloud"), token_count(3000))
+rollout("legacy", meta("ollama"),
+        {"timestamp": STAMP, "type": "event_msg", "payload": {"type": "user_message", "message": "<user_instructions>", "kind": "user_instructions"}},
+        {"timestamp": STAMP, "type": "event_msg", "payload": {"type": "user_message", "message": "fix it"}}, context("qwen-legacy"), token_count(1000))
+rollout("subagent", {"timestamp": STAMP, "type": "session_meta", "payload": {"model_provider": "ollama", "source": {"subagent": "review"}}},
+        context("qwen-review"), typed(), token_count(1000))
+record = local()
+expect("Local counts the prompts typed, under the model that answered them", {
+  "prompts": record["todayPrompts"], "sessions": record["totalSessions"], "models": models(record), "ready": record["ready"],
+}, {"prompts": 2, "sessions": 3, "models": ["qwen-legacy", "qwen-review", "qwen-tools"], "ready": True}, record)
+
+# A rollout records its provider's id, never the URL it reached, so a custom
+# provider's endpoint is remembered from config.toml: its history stays local
+# after the provider leaves the config, as in a real Codex 0.163 run on a
+# provider since removed. A profile's <name>.config.toml names providers too.
+# One the config never named is still nobody's, and a config that moves an id
+# to a hosted URL wins over what was remembered.
+use_home()
+codex_config = Path(os.environ["CODEX_HOME"]) / "config.toml"
+codex_config.parent.mkdir(parents=True, exist_ok=True)
+codex_config.write_text('model_provider = "mocklocal"\n\n[model_providers.mocklocal]\nname = "mock"\nbase_url = "http://127.0.0.1:18441/v1"\n'
+                        '\n[model_providers.boxed]\nbase_url = "http://192.168.1.20:8000/v1"\n')
+turn("mocklocal", "mocklocal", "gpt-5.1-codex")
+turn("boxed", "boxed", "qwen-boxed")
+turn("unseen", "unseen", "qwen-unseen")
+(codex_config.parent / "work.config.toml").write_text('[model_providers.profiled]\nbase_url = "http://gpu-box:8080/v1"\n')
+turn("profiled", "profiled", "qwen-profiled")
+before = local()
+codex_config.write_text('model = "gpt-5.1-codex"\n\n[model_providers.boxed]\nbase_url = "https://api.example.com/v1"\n')
+after = local()
+expect("Local keeps a custom Codex provider's history after it leaves config.toml", [models(before), models(after)],
+       [["gpt-5.1-codex", "qwen-boxed", "qwen-profiled"], ["gpt-5.1-codex", "qwen-profiled"]], after)
+
+# Only a turn with no time at all takes the file's day; a time of 0, false or
+# "" can't be trusted, so that turn counts nowhere, as in the Codex collector.
+use_home()
+untimed = dict(token_count(9000))
+del untimed["timestamp"]
+rollout("falsy", meta("ollama"), {"timestamp": STAMP, "type": "turn_context", "payload": {"model": "qwen-falsy"}},
+        *({**token_count(1000 * n), "timestamp": falsy} for n, falsy in enumerate((0, False, ""), 1)), untimed)
+record = local()
+expect("Local counts a Codex turn with an untrusted time nowhere, and one with none on the file's day",
+       [record["todayTotalTokens"], record["modelUsage"].get("qwen-falsy", {}).get("inputTokens")], [1100, 1000], record)
 
 # ------------------------------------------------------------- pi and opencode
 
@@ -184,6 +269,28 @@ write_pi_session(home() / ".pi" / "agent" / "sessions" / "--claimed--" / "one.js
 record = local()
 expect("Local leaves out exactly the rows another collector claims",
        [record["todayTotalTokens"], models(record)], [100, ["antigravity-pi-gemini", "gemini-oc", "gemini-vertex", "minimax-gateway"]], record)
+
+# Claude Code pointed at a self-hosted endpoint (Ollama's guide sets
+# localhost:11434) ran its models here, but a cloud-tagged one is Ollama's
+# and a Claude one went on to Anthropic; with no endpoint, nothing is local.
+sandbox()
+claude_code_session("box", [("qwen3-coder", 30), ("glm-4.6:cloud", 300), ("claude-sonnet-4-5", 40)])
+record = local()
+expect("Local counts no Claude Code reply while Claude Code is sent to Anthropic", [record["todayTokensByModel"], record["ready"]], [{}, False], record)
+claude_code_session("box", [("qwen3-coder", 30), ("glm-4.6:cloud", 300), ("claude-sonnet-4-5", 40)], base_url="http://localhost:11434")
+record = local()
+expect("Local counts the Claude Code replies a self-hosted endpoint ran itself",
+       [record["todayTokensByModel"], record["todayPrompts"], record["todaySessions"]], [{"qwen3-coder": 30}, 1, 1], record)
+
+# A MiniMax Code custom provider on this machine or the LAN ran its models
+# here; one at a gateway nothing can place is nobody's.
+sandbox()
+mcode_routed_session("box", "custom_provider:box", "qwen-box", 1387, base_url="http://127.0.0.1:18082/anthropic")
+mcode_routed_session("lan", "custom_provider:lan", "qwen-lan", 30, base_url="http://gpu-box.lan:8080/v1")
+mcode_routed_session("far", "custom_provider:far", "qwen-far", 5, base_url="https://gateway.example.com/v1")
+record = local()
+expect("Local counts MiniMax Code replies on a self-hosted custom provider, and none elsewhere",
+       [record["todayTokensByModel"], record["todayPrompts"], record["todaySessions"]], [{"qwen-box": 1387, "qwen-lan": 30}, 2, 2], record)
 
 # ---------------------------------------------------------------- contract
 

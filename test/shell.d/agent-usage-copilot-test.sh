@@ -115,6 +115,14 @@ configured(monthlyCredits=3000, remote=False)
 record = copilot()
 expect("the estimate follows the monthlyCredits budget", [record["tierLabel"], record["limits"][0]["percent"]], ["", 0.0005], record)
 
+# An infinite or huge cost on one damaged row is no spend at all, not an
+# allowance filled on its own; the row's request still counts.
+sandbox()
+configured(monthlyCredits=1500, remote=False)
+store([("sess-inf", NOW, "gpt-5.2", "1e400", 10, 1, 0, 0, 0), ("sess-huge", NOW, "gpt-5.2", "1e300", 10, 1, 0, 0, 0)])
+record = copilot()
+expect("a non-finite or huge cost is skipped", [record["todayPrompts"], record["limits"][0]["percent"]], [2, 0.0], record)
+
 # The store is opened by its URI, so a home whose path holds URI syntax
 # (? # %) still reads.
 sandbox()
@@ -218,6 +226,17 @@ expect("a midnight-spanning segment is booked on both days",
        [record["recentDays"][-2]["messageCount"], record["recentDays"][-1]["messageCount"], record["todayTotalTokens"]], [906, 494, 494], record)
 expect("a split segment's totals stay whole", record["modelUsage"]["claude-sonnet-4.6"],
        {"inputTokens": 600, "outputTokens": 100, "cacheReadInputTokens": 600, "cacheCreationInputTokens": 100}, record)
+
+# A transcript time that can't be trusted (digits int() refuses, zero,
+# negative, boolean, empty, or outside 2000-2100) counts nowhere, never
+# failing the record; only a line with no time at all takes the file's.
+sandbox()
+configured(remote=False)
+damaged = ["9" * 5000, "\u00b2", 0, -1, True, "", "1970-01-01T00:00:00Z", "2200-01-01T00:00:00Z"]
+transcript("sess-damaged", [("user.message", {"content": "prompt"}, at) for at in damaged + [None]])
+record = copilot()
+expect("an untrusted transcript time counts nowhere, and a missing one on the file's day",
+       [record["totalPrompts"], record["activeDates"]], [1, [TODAY]], record)
 
 # --------------------------------------------------------------- contract
 
@@ -376,6 +395,89 @@ record = copilot(routes=snapshot_without("entitlement", "credits_used", unlimite
 expect("an unlimited allowance needs no amounts", meter(record),
        {"limits": [], "stale": False, "status": "", "retry": False, "tier": "Pro"}, record)
 
+# GitHub's own snapshot, as the CLI's CopilotUserResponseQuotaSnapshots types
+# it, carries no credits_used: what is used is the entitlement less what
+# remains, read from remaining, quota_remaining or percent_remaining.
+def upstream(**remaining):
+  answer = quota("individual", 300, 0, overage_count=0, overage_permitted=False, quota_id="premium_interactions",
+                 timestamp_utc=NOW, has_quota=True, token_based_billing=True, **remaining)
+  del answer["quota_snapshots"]["premium_interactions"]["credits_used"]
+  return {QUOTA_URL: answer}
+
+
+shapes = {
+  "remaining": upstream(remaining=225, quota_remaining=225, percent_remaining=75),
+  "quota_remaining": upstream(quota_remaining=225),
+  "percent_remaining": upstream(percent_remaining=75),
+}
+read = {name: meter(copilot(routes=routes)) for name, routes in shapes.items()}
+expect("an upstream allowance is used by what it has left",
+       read, {name: {"limits": [["Monthly allowance", 0.25, True]], "stale": False, "status": "", "retry": False, "tier": "Pro"} for name in shapes}, read)
+
+# A reset date that can't be read is no reset date, both live and once kept.
+damaged_reset = quota("individual", 300, 30)
+damaged_reset["quota_reset_date_utc"] = "\u00b2"
+live = meter(copilot(routes={QUOTA_URL: damaged_reset}))
+kept = meter(copilot(routes={QUOTA_URL: damaged_reset}, mode=500))
+expect("an unreadable reset date reads as none, live and kept",
+       [live["limits"], kept["limits"], kept["stale"]], [[["Monthly allowance", 0.1, False]], [["Monthly allowance", 0.1, False]], True], [live, kept])
+
 for name in ("COPILOT_QUOTA_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
   del os.environ[name]
+# ---------------------------------------------------- the current store
+
+# A current CLI's store, its schema as Copilot CLI 1.0.102 writes it: who
+# started each request (initiator "user" for a typed prompt, "agent" for the
+# agent's own follow-up, as a tool loop's next step), and GitHub's usage
+# report on each request it served.
+def current_store(rows):
+  path = copilot_home() / "session-store.db"
+  path.parent.mkdir(parents=True, exist_ok=True)
+  conn = sqlite3.connect(path)
+  conn.execute("CREATE TABLE IF NOT EXISTS assistant_usage_events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, turn_index INTEGER, agent_id TEXT,"
+               " parent_tool_call_id TEXT, model TEXT NOT NULL, copilot_usage_model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,"
+               " cache_write_tokens INTEGER, reasoning_tokens INTEGER, total_nano_aiu INTEGER, request_multiplier REAL, duration_ms INTEGER,"
+               " time_to_first_token_ms INTEGER, output_ttft_ms REAL, inter_token_latency_ms INTEGER, initiator TEXT, api_endpoint TEXT, reasoning_effort TEXT,"
+               " finish_reason TEXT, content_filter_triggered INTEGER, token_details_json TEXT, created_at TEXT DEFAULT (datetime('now')))")
+  conn.executemany("INSERT INTO assistant_usage_events (session_id, turn_index, model, copilot_usage_model, input_tokens, output_tokens, cache_read_tokens,"
+                   " cache_write_tokens, reasoning_tokens, total_nano_aiu, request_multiplier, initiator, api_endpoint, finish_reason, created_at)"
+                   " VALUES (?, ?, ?, ?, ?, ?, ?, 0, 5, ?, ?, ?, '/chat/completions', ?, ?)", rows)
+  conn.commit()
+  conn.close()
+
+
+sandbox()
+configured(remote=False)
+current_store([
+  ("sess-a", 0, "gpt-5.2", "gpt-5.2", 1000, 100, 100, 1_000_000_000, 1.0, "user", "stop", NOW),
+  ("sess-b", 0, "gpt-5.2", "gpt-5.2", 1000, 100, 100, 1_000_000_000, 1.0, "user", "tool_calls", NOW),
+  ("sess-b", 0, "gpt-5.2", "gpt-5.2", 1000, 100, 100, 0, 1.0, "agent", "stop", NOW),
+  ("sess-a", 1, "gpt-5.2", "gpt-5.2", 1000, 100, 100, 1_000_000_000, 1.0, "user", "stop", NOW),
+])
+record = copilot()
+expect("a current store counts the prompts typed, not the agent's follow-up calls, and shows them",
+       {key: record[key] for key in ("ready", "hasPromptStats", "todayPrompts", "totalPrompts", "todaySessions", "todayTotalTokens")},
+       {"ready": True, "hasPromptStats": True, "todayPrompts": 3, "totalPrompts": 3, "todaySessions": 2, "todayTotalTokens": 4400}, record)
+
+# A request sent to a custom provider (BYOK, COPILOT_PROVIDER_BASE_URL) has
+# no GitHub usage report: GitHub billed nothing, so it isn't Copilot's.
+current_store([
+  ("sess-byok", 0, "mock-model", None, 21372, 251, 271, None, 0.0, "user", "stop", NOW),
+  ("sess-byok", 1, "mock-model", None, 21675, 254, 274, None, 0.0, "user", "stop", NOW),
+])
+record = copilot()
+expect("a request to a custom provider isn't counted as Copilot's",
+       {key: record[key] for key in ("todayPrompts", "todaySessions", "todayTotalTokens")} | {"models": sorted(record["modelUsage"])},
+       {"todayPrompts": 3, "todaySessions": 2, "todayTotalTokens": 4400, "models": ["gpt-5.2"]}, record)
+
+# A machine where Copilot only ever ran against a custom provider has nothing
+# of Copilot's to show, and its transcripts aren't read in the store's place.
+sandbox()
+configured(remote=False)
+current_store([("sess-byok", 0, "mock-model", None, 21372, 251, 271, None, 0.0, "user", "stop", NOW)])
+transcript("sess-byok", [("user.message", {"content": "Say hi"}, NOW),
+                         ("session.shutdown", {"modelMetrics": {"mock-model": {"usage": {"inputTokens": 21372, "outputTokens": 251}}}}, NOW)])
+record = copilot()
+expect("a store of custom-provider requests alone leaves Copilot empty",
+       [record["ready"], record["totalPrompts"], record["todayTotalTokens"]], [False, 0, 0], record)
 PY

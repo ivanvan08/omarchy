@@ -223,7 +223,22 @@ def reset_from_seconds(value):
   seconds = number(value)
   if seconds <= 0:
     return ""
-  return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+  try:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+  except OverflowError:
+    # Further out than a date goes: no reset time to show.
+    return ""
+
+
+def iso_reset(value):
+  # Only an ISO time is a reset time; an epoch, a list or garbage is none.
+  if not isinstance(value, str) or not value.strip():
+    return ""
+  try:
+    datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+  except ValueError:
+    return ""
+  return value.strip()
 
 
 # The live endpoint nests the windows under "usage" with "percent" and
@@ -249,7 +264,7 @@ def parse_usage(payload):
     limits.append({
       "label": label,
       "percent": max(0.0, min(1.0, percent)),
-      "resetsAt": str(window.get("resetsAt") or "").strip() or reset_from_seconds(window.get("resetInSec")),
+      "resetsAt": iso_reset(window.get("resetsAt")) or reset_from_seconds(window.get("resetInSec")),
     })
   return limits
 
@@ -281,10 +296,9 @@ def probe_limits(credential):
       return {"ok": False, "helpText": f"OpenCode's usage endpoint returned status {error.status}. Local OpenCode stats are still shown."}
     payload = None
   except Exception:
-    # A transport failure reached no server at all: no route, no DNS, a
-    # timeout. Any real answer, including an error status, is a server we
-    # should stop pestering; this is not.
-    return unreachable
+    # open_json already names every transport failure, so anything else is
+    # a broken answer, and retrying soon won't mend it.
+    payload = None
 
   if not isinstance(payload, dict) or not payload:
     return {"ok": False, "helpText": "OpenCode's usage endpoint returned no data. Local OpenCode stats are still shown."}
@@ -311,7 +325,8 @@ def collect_limits(force):
 
   # Limits only ever show for a Go plan, so a tier follows them.
   def answer(limits, fetched_at, stale):
-    result.update(limits=limits, tierLabel="Go" if limits else "", stale=stale, fetchedAtMs=fetched_at if limits else 0)
+    # Stale says limits were kept past a failed check, so none kept is none stale.
+    result.update(limits=limits, tierLabel="Go" if limits else "", stale=stale and bool(limits), fetchedAtMs=fetched_at if limits else 0)
     return result
 
   refused = None

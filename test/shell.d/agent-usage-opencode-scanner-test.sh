@@ -34,16 +34,16 @@ def sessions():
 # "opencode-local" gateway is somewhere else, and a user line is no reply.
 sandbox()
 write_pi_session(sessions() / "project" / "pi.jsonl", [
-  pi_reply("opencode", id="pi-1", model="deepseek-v4.1-flash:high", usage={"input": 100, "output": 10, "reasoning": 5, "cacheRead": 20, "cacheWrite": 3}),
+  pi_reply("opencode", id="pi-1", model="deepseek-v4.1-flash:high", usage={"input": 100, "output": 15, "reasoning": 5, "cacheRead": 20, "cacheWrite": 3}),
   pi_reply("opencode-local", id="pi-2", model="gpt-nope", usage={"input": 999, "output": 999}),
   {"type": "message", "id": "pi-3", "timestamp": iso_in(0), "message": {"role": "user", "provider": "opencode", "model": "deepseek-v4.1-flash", "usage": {"input": 999, "output": 999}}},
 ])
 write_pi_session(home() / ".omp" / "agent" / "sessions" / "project" / "omp.jsonl", [
-  pi_reply("opencode-go", id="omp-1", model="minimax-m3", usage={"input": 50, "output": 4, "reasoning": 1, "cacheRead": 5, "cacheWrite": 0}),
+  pi_reply("opencode-go", id="omp-1", model="minimax-m3", usage={"input": 50, "output": 5, "reasoningTokens": 1, "cacheRead": 5, "cacheWrite": 0}),
   pi_reply("openai-codex", id="other-1", model="gpt-nope", usage={"input": 999, "output": 999}),
 ])
 record = opencode()
-expect("OpenCode counts its Zen and Go usage from pi and omp, folding reasoning into output and stripping the thinking suffix", {
+expect("OpenCode counts its Zen and Go usage from pi and omp, reasoning already in output, stripping the thinking suffix", {
   "name": record["name"], "today": record["todayTotalTokens"], "models": record["modelUsage"],
 }, {
   "name": "OpenCode", "today": 198, "models": {

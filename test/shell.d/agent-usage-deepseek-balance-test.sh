@@ -105,7 +105,8 @@ check("DeepSeek collector keeps a balance per key",
 # An answer without a readable total_balance is a failed check, not a balance
 # of zero: it keeps the last balance, stale, and never replaces it.
 deepseek()
-for incomplete in ([{}], [{"currency": "USD", "total_balance": None}], [{"total_balance": "NaN"}], [{"total_balance": True}]):
+# A total too large for the record's number is as unreadable as no total.
+for incomplete in ([{}], [{"currency": "USD", "total_balance": None}], [{"total_balance": "NaN"}], [{"total_balance": True}], [{"total_balance": "1e400"}]):
   with FakeHttp({BALANCE: {"is_available": True, "balance_infos": incomplete}}):
     record = collect("deepseek", "--force")
   check(f"DeepSeek collector keeps the last balance, stale, when DeepSeek answers {incomplete}",
@@ -113,6 +114,15 @@ for incomplete in ([{}], [{"currency": "USD", "total_balance": None}], [{"total_
         and "total_balance" in record["authHelpText"], record)
   record, _ = deepseek(500)
   expect(f"DeepSeek collector never caches {incomplete} over the last balance", [record["balance"]["remaining"], record["limitsStale"]], [8.15, True], record)
+
+# DEEPSEEK_API_BASE_URL moves the endpoint, never the key onto plain HTTP to
+# another machine, nor into a URL that isn't one.
+for url in ("http://evil.example", "not a url"):
+  os.environ["DEEPSEEK_API_BASE_URL"] = url
+  record, http = deepseek()
+  expect(f"DeepSeek collector sends its key to no untrusted endpoint ({url})",
+         [http.count, record["usageStatusText"], "HTTPS" in record["authHelpText"]], [0, "Balance unavailable", True], record)
+del os.environ["DEEPSEEK_API_BASE_URL"]
 
 # A balance never rolls back one another run stamped while this one waited on
 # the network.
@@ -131,7 +141,7 @@ expect("DeepSeek collector never overwrites a newer cached balance with its own"
 
 # Untrusted amounts read as nothing rather than as a number.
 expect("DeepSeek collector reads untrusted amounts as zero",
-       [float(load_collector("deepseek").money(value)) for value in ("NaN", "Infinity", True, "abc", None, "3.5")], [0.0, 0.0, 0.0, 0.0, 0.0, 3.5])
+       [float(load_collector("deepseek").money(value)) for value in ("NaN", "Infinity", "1e400", True, "abc", None, "3.5")], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.5])
 
 # The key pi keeps, where PI_CODING_AGENT_DIR moves it, or omp's. Only a
 # literal key: a `!command` or `$VAR` entry is pi's to resolve, never sent.
@@ -168,4 +178,30 @@ record, _ = deepseek("down")
 expect("DeepSeek collector keeps one key's balance per API host",
        [http.requests[0]["url"], "balance" in other, other["usageStatusText"], record["balance"]["remaining"], record["limitsStale"]],
        ["https://deepseek.example/user/balance", False, "Balance unavailable", float(answer["total"]), True], other)
+
+# balance_infos holds one entry per currency, CNY or USD (DeepSeek's
+# get-user-balance reference): the funded one is the balance, so an empty CNY
+# entry never reads as an empty account beside USD credit.
+sandbox()
+os.environ["DEEPSEEK_API_KEY"] = "key-123"
+with FakeHttp({BALANCE: {"is_available": True, "balance_infos": [
+  {"currency": "CNY", "total_balance": "0.00", "granted_balance": "0.00", "topped_up_balance": "0.00"},
+  {"currency": "USD", "total_balance": "12.50", "granted_balance": "0.00", "topped_up_balance": "12.50"},
+]}}):
+  record = collect("deepseek", "--force")
+expect("DeepSeek collector reads the currency that holds the credit",
+       [record["balance"]["remaining"], record["balance"]["currency"], record["usageStatusText"]], [12.5, "USD", ""], record)
+
+# is_available false is DeepSeek saying the balance no longer covers a call:
+# with no funded figure the gauge raises no alarm, so the status does, and a
+# reused answer keeps saying so.
+with FakeHttp({BALANCE: {"is_available": False, "balance_infos": [
+  {"currency": "CNY", "total_balance": "0.00", "granted_balance": "0.00", "topped_up_balance": "0.00"},
+]}}):
+  record = collect("deepseek", "--force")
+expect("DeepSeek collector reads an unavailable balance as Out of credits",
+       [record["balance"]["remaining"], record["usageStatusText"], "Top up" in record["authHelpText"], record.get("retryAdvised")],
+       [0.0, "Out of credits", True, None], record)
+record, http = deepseek(500, ())
+expect("DeepSeek collector keeps saying Out of credits from the balance it reuses", [http.count, record["usageStatusText"]], [0, "Out of credits"], record)
 PY

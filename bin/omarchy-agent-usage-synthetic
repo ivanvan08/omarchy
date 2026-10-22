@@ -40,6 +40,7 @@ from collectors import (  # noqa: E402
   scan_max_age,
   scan_opencode,
   scan_pi_sessions,
+  trusted_endpoint,
 )
 
 AGENT_ID = "synthetic"
@@ -207,6 +208,10 @@ def parse_quotas(payload):
 
 
 def probe_quotas(key, base_url):
+  # SYNTHETIC_API_BASE_URL moves the endpoint, never the key onto a
+  # connection anyone on the way can read.
+  if not trusted_endpoint(base_url):
+    return {"ok": False, "helpText": "SYNTHETIC_API_BASE_URL must use HTTPS (plain HTTP only for loopback). Local Synthetic stats are still shown."}
   request = urllib.request.Request(
     base_url.rstrip("/") + "/v2/quotas",
     headers={

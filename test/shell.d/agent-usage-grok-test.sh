@@ -17,22 +17,31 @@ from agent_usage_fixtures import *
 
 PERIOD_END = iso_in(9 * 86400)
 USED = {"token-main": 42.0, "token-side": 7.0, "token-fresh": 0}
-answer = {"percent": None}
+answer = {"percent": None, "end": None}
 
 
 # Shaped like xAI's answer: protobuf JSON under config, which drops a
-# percentage of zero.
+# percentage of zero. A unified-billing account has no percentage there at
+# all; its monthly quota comes on the billing answer without the credits
+# format, its amounts money fields of {"val": n}.
 def credits(request):
   token = request.get_header("Authorization").split(" ", 1)[1]
-  config = {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": PERIOD_END}, "billingPeriodEnd": PERIOD_END}
+  config = {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": answer["end"] or PERIOD_END}, "billingPeriodEnd": PERIOD_END}
   if USED.get(token):
     config["creditUsagePercent"] = USED[token]
   if answer["percent"] is not None:
     config["creditUsagePercent"] = answer["percent"]
+  if token == "token-unified":
+    config["isUnifiedBillingUser"] = True
   return {"config": config}
 
 
-ROUTES = {"cli-chat-proxy.grok.com/v1/billing?format=credits": credits}
+def monthly(request):
+  return {"config": {"isUnifiedBillingUser": True, "billingPeriodStart": iso_in(-20 * 86400), "billingPeriodEnd": PERIOD_END,
+                     "monthlyLimit": {"val": 1000}, "used": {"val": 900}}}
+
+
+ROUTES = {"cli-chat-proxy.grok.com/v1/billing?format=credits": credits, "cli-chat-proxy.grok.com/v1/billing": monthly}
 
 
 # A home signed in the way the Grok CLI leaves it.
@@ -133,7 +142,7 @@ expect("a week that reset while Grok was idle starts over at zero",
 for path in limits_cache_files("grok"):
   path.unlink()
 record = grok()
-expect("a lapsed token with nothing cached says to start Grok", [record["usageStatusText"], record["limits"]], ["Limits paused", []], record)
+expect("a lapsed token with nothing cached says to start Grok, with no limits to call stale", [record["usageStatusText"], record["limits"], record["limitsStale"]], ["Limits paused", [], False], record)
 
 # A refresh token past Grok's 30-day sign-in can't renew anything: signed out.
 signed_in(grok_home(), expires=iso_in(-31 * 86400), refresh_token="r")
@@ -158,6 +167,33 @@ signed_in(grok_home(), token="token-fresh")
 record = grok()
 expect("an untouched period reads as 0% rather than nothing known",
        [record["limits"][0]["label"], record["limits"][0]["percent"]], ["Weekly", 0.0], record)
+
+# A period already over without a percentage says nothing about this one: no
+# answer, the last numbers kept as stale.
+answer["end"] = iso_in(-3600)
+record = grok()
+answer["end"] = None
+expect("an ended period without a percentage is no answer, keeping the last numbers",
+       [record["limits"][0]["percent"], record["limitsStale"]], [0.0, True], record)
+
+# A unified-billing account leaves the percentage out of the credits answer,
+# its usage counted against the monthly quota the plain billing answer gives.
+sandbox()
+signed_in(grok_home(), token="token-unified")
+record = grok()
+expect("a unified-billing account reads its monthly quota, not a confident 0%",
+       [record["limits"][0]["label"], record["limits"][0]["percent"], record["limitsStale"], bool(record["limits"][0]["resetsAt"])],
+       ["Monthly", 0.9, False, True], record)
+
+# A unified-billing account can also carry a weekly percentage on the credits
+# answer; Grok's /usage then shows the monthly included quota beside it.
+sandbox()
+signed_in(grok_home(), token="token-unified")
+answer["percent"] = 30
+record = grok()
+answer["percent"] = None
+expect("a unified-billing account with weekly credits shows the monthly quota beside them",
+       [[limit["label"], limit["percent"]] for limit in record["limits"]], [["Weekly", 0.3], ["Monthly", 0.9]], record)
 
 # ------------------------------------------------------------- accounts
 
@@ -195,10 +231,28 @@ record = grok()
 expect("a list-shaped modelUsage and a non-object settings read as empty",
        [record["ready"], record["tierLabel"], record["todayPrompts"], record["modelUsage"]], [True, "", 1, {}], record)
 
+# A session or turn time out of range (year 1, before 2000, past 2100) is an
+# untrusted stamp: it skips that session or turn, never the record.
+sandbox()
+signed_in(grok_home())
+summary(grok_home(), "good", iso_in(0), 2)
+write_json(grok_home() / "sessions" / "%2Fhome%2Fme" / "good" / "usage.json", {"turns": [
+  {"endedAt": iso_in(0), "modelUsage": {"grok-4.7-build": {"inputTokens": 10, "outputTokens": 1}}},
+  {"endedAt": "0001-01-01T00:00:00+00:00", "modelUsage": {"grok-4.7-build": {"inputTokens": 500}}},
+  {"endedAt": "9999-12-31T23:59:59+00:00", "modelUsage": {"grok-4.7-build": {"inputTokens": 500}}},
+]})
+for name, stamp in (("year1", "0001-01-01T00:00:00+00:00"), ("1970", "1970-01-01T00:00:00Z"), ("far", "2999-01-01T00:00:00Z")):
+  summary(grok_home(), name, stamp, 7)
+record = grok()
+expect("Grok skips sessions and turns with out-of-range times",
+       [record["totalSessions"], record["totalPrompts"], record["todayPrompts"], record["todayTotalTokens"], record["activeDates"]],
+       [1, 1, 1, 11, [datetime.now().date().isoformat()]], record)
+
 # ---------------------------------------------------------- local stats
 
-# Sessions come from each session's summary; tokens and today's prompts from
-# its usage.json, one entry per finished turn, with cached input kept apart.
+# Sessions come from each session's summary; tokens and prompts from its
+# usage.json, one entry per finished turn, with cached input kept apart. The
+# summary's num_messages counts the model's replies too, so it isn't read.
 sandbox()
 signed_in(grok_home())
 now = iso_in(0)
@@ -217,10 +271,36 @@ record = grok()
 expect("Grok counts sessions, prompts, and tokens from its session files",
        {key: record[key] for key in ("hasLocalStats", "todayPrompts", "todaySessions", "totalPrompts", "totalSessions", "activeDays", "todayTotalTokens", "todayTokensByModel")}
        | {"today": record["recentDays"][6]["messageCount"]},
-       {"hasLocalStats": True, "todayPrompts": 2, "todaySessions": 2, "totalPrompts": 10, "totalSessions": 3, "activeDays": 2,
+       {"hasLocalStats": True, "todayPrompts": 2, "todaySessions": 2, "totalPrompts": 3, "totalSessions": 3, "activeDays": 2,
         "todayTotalTokens": 1265, "todayTokensByModel": {"grok-4.7-build": 1265}, "today": 1265}, record)
 expect("Grok's tokens by model keep cached input apart", record["modelUsage"], {
   "grok-4.6": {"inputTokens": 500, "outputTokens": 20, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
   "grok-4.7-build": {"inputTokens": 300, "outputTokens": 60, "cacheReadInputTokens": 900, "cacheCreationInputTokens": 5},
 }, record)
+
+# A fork repeats its source's turns verbatim ahead of its own, as `grok -r
+# <id> --fork-session` leaves its usage.json; each turn counts once. A
+# subagent's turns are tokens spent, but no prompts typed.
+sandbox()
+signed_in(grok_home())
+sessions = grok_home() / "sessions" / "%2Fhome%2Fme"
+
+
+def turn(number, seconds_ago, tokens):
+  ended = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%S.620236893+00:00")
+  usage = {"inputTokens": tokens, "outputTokens": 10, "cachedReadTokens": 0, "cacheCreationTokens": 0, "reasoningTokens": 5, "totalTokens": tokens + 10, "modelCalls": 1}
+  return {"turnNumber": number, "endedAt": ended, **usage, "turnCount": 1, "primaryModelId": "grok-build", "modelUsage": {"grok-build": usage}}
+
+
+first, second = turn(1, 4, 100), turn(2, 3, 200)
+write_json(sessions / "source" / "summary.json", {"last_active_at": iso_in(-3), "num_messages": 7, "session_kind": "headless"})
+write_json(sessions / "source" / "usage.json", {"turns": [first, second]})
+write_json(sessions / "fork" / "summary.json", {"last_active_at": iso_in(-1), "num_messages": 11, "session_kind": "headless",
+                                                 "parent_session_id": "source", "forked_at": iso_in(-2)})
+write_json(sessions / "fork" / "usage.json", {"turns": [first, second, turn(3, 1, 400)]})
+write_json(sessions / "child" / "summary.json", {"last_active_at": iso_in(-2), "num_messages": 5, "session_kind": "subagent"})
+write_json(sessions / "child" / "usage.json", {"turns": [turn(1, 2, 800)]})
+record = grok()
+expect("a fork's copied turns count once, and a subagent's turns as tokens but no prompts",
+       [record["totalSessions"], record["totalPrompts"], record["todayPrompts"], record["todayTotalTokens"]], [3, 3, 3, 1540], record)
 PY

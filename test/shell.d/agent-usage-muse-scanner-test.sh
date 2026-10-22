@@ -332,12 +332,48 @@ new_muse_home()
 prompt = pi_reply("meta", 5000, id="user", model="muse-spark")
 prompt["message"]["role"] = "user"
 write_pi_session(home() / ".pi" / "agent" / "sessions" / "p" / "a.jsonl", [
+  prompt,
   pi_reply("meta", 10, id="meta", model="muse-spark"),
   pi_reply("opencode", 5000, id="zen", model="muse-spark"),
-  prompt,
 ])
 record = muse()
 expect("Muse counts Meta's pi replies alone", [record["todayTotalTokens"], record["totalPrompts"]], [10, 1], record)
+
+# ---------------------------------------------------------- child agents
+
+# Muse credits each billed run to its owner in the session's log, as `muse
+# exec` writes it: the main agent, and the reminder children that watch a
+# prompt. A child with a log of its own is counted from its completions; one
+# without (a skill reminder) is known only from its attribution, which counts
+# once however many copies of it the log holds, and answers no prompt.
+new_muse_home()
+
+
+def attribution(owner_id, owner_type, input, cached, output, usage_id):
+  record = {"goal_attribution": {"mode": "none"}, "owner": {"owner_id": owner_id, "owner_type": owner_type, "requester_kind": "reminder",
+            "run_id": "run-1", "session_id": "run-1"}, "quantity": {"cached_tokens": cached, "input_tokens": input, "main_llm_steps": 0,
+            "output_tokens": output, "reasoning_tokens": 5, "reported": True, "unit": "tokens"}, "schema_version": 1,
+            "usage_family": "provider", "usage_id": usage_id}
+  return {"schema_version": 1, "id": "rec-" + usage_id, "recorded_at": NOW_US, "record_type": "event", "payload_type": "runtime.session",
+          "payload": {"event": {"kind": "goal_usage_attribution", "record": record}, "kind": "run", "run_id": "run-1"}}
+
+
+skill_reminder = attribution("child-skill", "reminder_child", 4000, 400, 40, "usage-skill")
+session("sess-C",
+        {"recorded_at": NOW_US, "payload": {"kind": "metadata", "record": {"model_id": "muse-spark-1.3-contributor", "provider_id": "meta"}}},
+        completion("muse-spark-1.3-contributor", input=1000, output=10, cache_read=100),
+        attribution("main-root", "main_root", 1000, 100, 10, "usage-main"),
+        attribution("child-logged", "reminder_child", 2000, 200, 20, "usage-logged"),
+        skill_reminder,
+        {"id": "frame-1", "children": [{"record_json": json.dumps(skill_reminder)}]})
+session("sess-C/subagent/child-logged",
+        completion("muse-spark-1.3-contributor", input=2000, output=20, cache_read=200),
+        attribution("child-logged", "reminder_child", 2000, 200, 20, "usage-logged-call"))
+record = muse()
+# Main 1010 + the logged child 2020 + the skill reminder 4040.
+expect("Muse counts a child agent's calls known only from the session's attribution, once and with no prompt",
+       pick(record, "todayTotalTokens", "todayPrompts", "todaySessions") | {"cached": record["modelUsage"]["muse-spark-1.3-contributor"]["cacheReadInputTokens"]},
+       {"todayTotalTokens": 7070, "todayPrompts": 2, "todaySessions": 1, "cached": 700}, record)
 
 # ---------------------------------------------------------------- contract
 

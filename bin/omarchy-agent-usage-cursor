@@ -139,12 +139,12 @@ class CursorClient:
     return self.call("GetCurrentPeriodUsage", {})
 
   # None when the plan couldn't be asked, so the last known one stands.
-  def plan_name(self) -> str | None:
+  def plan_info(self) -> dict[str, Any] | None:
     try:
       plan = self.call("GetPlanInfo", {}).get("planInfo")
     except CursorError:
       return None
-    return str(plan.get("planName") or "") if isinstance(plan, dict) else ""
+    return plan if isinstance(plan, dict) else {}
 
   def aggregations(self, start_millis: int, end_millis: int) -> list[Any]:
     payload = {"startDate": str(start_millis), "endDate": str(end_millis)}
@@ -288,30 +288,51 @@ def usage_section(period: dict[str, Any], key: str) -> dict[str, Any]:
   return section
 
 
-def summarize_limits(period: dict[str, Any]) -> list[dict[str, Any]]:
+# PlanInfo.included_usage_period says whether the included allowance runs on
+# the billing cycle or resets each week, at included_usage_resets_at. The
+# enum may arrive as its number or its name, prefixed or not.
+def weekly_included(plan: dict[str, Any] | None) -> bool:
+  value = (plan or {}).get("includedUsagePeriod")
+  if isinstance(value, bool):
+    return False
+  return value == 2 or (isinstance(value, str) and value.strip().upper() in ("WEEKLY", "INCLUDED_USAGE_PERIOD_WEEKLY"))
+
+
+# The weekly reset as an epoch in milliseconds, like billingCycleEnd; one
+# small enough to be seconds is read as seconds rather than as 1970.
+def weekly_reset(value: Any) -> str:
+  stamp = number(value)
+  return iso(stamp * 1000 if 0 < stamp < 100_000_000_000 else stamp)
+
+
+def summarize_limits(period: dict[str, Any], plan_info: dict[str, Any] | None = None) -> list[dict[str, Any]]:
   """Cursor's own percentages, never a percentage derived from spend.
 
   The dollar figures do not divide into the allowance: bonus usage the
   providers hand out is spend without an allowance behind it, so
   totalSpend/limit reads well past 100% while Cursor's own meters do not.
 
-  Every meter runs on the billing cycle. The included total is the Monthly
-  row; the model meters and the on-demand budget are titled after it, so the
+  Every meter runs on the billing cycle, unless the plan says its included
+  allowance is weekly. The included total is the Monthly (or Weekly) row;
+  the model meters and the on-demand budget are titled after it, so the
   panel attaches them to that row rather than showing four rows that each
-  read "Monthly".
+  read "Monthly". The on-demand budget always runs on the billing cycle.
   """
   plan = usage_section(period, "planUsage")
   spend = usage_section(period, "spendLimitUsage")
   resets_at = iso(period.get("billingCycleEnd"))
+  window, included_resets_at = "Monthly", resets_at
+  if weekly_included(plan_info):
+    window, included_resets_at = "Weekly", weekly_reset((plan_info or {}).get("includedUsageResetsAt"))
   limits = []
 
   for label, title, key in (
-    ("Included total", "Monthly", "totalPercentUsed"),
-    ("Auto models", "Auto models Monthly", "autoPercentUsed"),
-    ("Named models", "Named models Monthly", "apiPercentUsed"),
+    ("Included total", window, "totalPercentUsed"),
+    ("Auto models", f"Auto models {window}", "autoPercentUsed"),
+    ("Named models", f"Named models {window}", "apiPercentUsed"),
   ):
     if key in plan:
-      limits.append({"label": label, "title": title, "percent": fraction(plan.get(key)), "resetsAt": resets_at})
+      limits.append({"label": label, "title": title, "percent": fraction(plan.get(key)), "resetsAt": included_resets_at})
 
   limit_cents = number(spend.get("individualLimit"))
   if limit_cents > 0:
@@ -403,7 +424,9 @@ def scan(api_base_url: str, auth_path: Path, limits_only: bool, state_db: Path |
     return record
 
   try:
-    limits = summarize_limits(client.period())
+    period = client.period()
+    plan = client.plan_info()
+    limits = summarize_limits(period, plan)
   except CursorError as error:
     if error.auth:
       return failed("Sign-in expired", "Cursor refused the saved sign-in. " + AUTH_HELP)
@@ -412,8 +435,7 @@ def scan(api_base_url: str, auth_path: Path, limits_only: bool, state_db: Path |
     print(f"omarchy-agent-usage-cursor: {type(error).__name__}", file=sys.stderr)
     return failed("" if kept else "Cursor limits unavailable", "Cursor's usage check failed.")
 
-  plan = client.plan_name()
-  tier = kept_tier if plan is None else plan
+  tier = kept_tier if plan is None else str(plan.get("planName") or "")
   # The cache only backs later runs; failing to keep it never costs this
   # run's live answer.
   record = base_record(ready=True, tierLabel=tier, limits=limits, limitsFetchedAt=cache.save(limits, tierLabel=tier))

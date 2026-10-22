@@ -135,6 +135,15 @@ expect("Antigravity collector takes omp's limits from omp usage, sending omp's l
 
 check("omp usage runs with nothing on its stdin", not (home() / "omp-stdin").exists())
 
+# An omp report of another shape is no answer: the kept limits stand, stale.
+report = {"provider": "google-antigravity", "metadata": {"email": "other@example.com"}}
+kept = []
+for shape in ({"reports": [dict(report, limits="x")]}, {"reports": [dict(report, limits=5)]}, {"reports": 5}):
+  write_json(home() / "omp-report.json", shape)
+  record, _ = agy()
+  kept.append([record["limitsStale"], [entry["percent"] for entry in record["limits"]]])
+expect("Antigravity collector keeps the last limits over an omp report of another shape", kept, [[True, [0.6, 0.3, 0.1]]] * 3, kept)
+
 # A window id of another shape still names one window, and a report naming no
 # account, with several omp sign-ins, is shown but kept for none of them.
 conn = sqlite3.connect(home() / ".omp" / "agent" / "agent.db")

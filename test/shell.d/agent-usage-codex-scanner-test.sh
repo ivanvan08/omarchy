@@ -114,28 +114,82 @@ def tokens(input, output, cached=0, total=None, kind="event_msg", **extra):
   return {"type": kind, "payload": {"type": "token_count", "info": info}}
 
 
+def typed(text="hello", **extra):
+  # A prompt as Codex 0.163 writes it in a paginated rollout.
+  item = {"type": "UserMessage", "id": "u1", "content": [{"type": "text", "text": text, "text_elements": []}]}
+  return {"type": "event_msg", **extra, "payload": {"type": "item_completed", "thread_id": "t1", "turn_id": "turn1", "item": item}}
+
+
 # ---------------------------------------------------------- native rollouts
 
-# A turn counts once: a quota notification repeats the last turn's usage under
-# an unchanged running total, and is no prompt either. Cached input and
-# reasoning are parts of input and output, not more of them.
+# A request counts once: a quota notification repeats the last request's usage
+# under an unchanged running total. Cached input and reasoning are parts of
+# input and output, not more of them, and the two requests one typed prompt
+# took are still one prompt.
 new_home()
 first = {"input_tokens": 100, "cached_input_tokens": 60, "output_tokens": 20, "reasoning_output_tokens": 5, "total_tokens": 120}
 second = {"input_tokens": 180, "cached_input_tokens": 110, "output_tokens": 30, "reasoning_output_tokens": 8, "total_tokens": 210}
-rollout("rollout.jsonl", context("gpt-test"),
+rollout("rollout.jsonl", context("gpt-test"), typed(),
         tokens(100, 20, 60, first, reasoning_output_tokens=5, total_tokens=120),
         tokens(80, 10, 50, second, reasoning_output_tokens=3, total_tokens=90),
         {**tokens(80, 10, 50, second, reasoning_output_tokens=3, total_tokens=90), "rate_limits": {"primary": {"used_percent": 10}}})
 record = codex("--force", env={"CODEX_ARGS_FILE": home() / "codex-args"})
-expect("Codex counts each turn once, without a quota notification as a prompt or cache and reasoning twice", {
+expect("Codex counts each request once, without a quota notification or cache and reasoning twice, and a prompt once", {
   "today": record["todayTotalTokens"], "prompts": record["todayPrompts"], "usage": record["modelUsage"]["gpt-test"], "help": record["authHelpText"],
 }, {
-  "today": 210, "prompts": 2, "usage": {"inputTokens": 70, "outputTokens": 30, "cacheReadInputTokens": 110, "cacheCreationInputTokens": 0}, "help": "",
+  "today": 210, "prompts": 1, "usage": {"inputTokens": 70, "outputTokens": 30, "cacheReadInputTokens": 110, "cacheCreationInputTokens": 0}, "help": "",
 }, record)
 # Separate arguments, not "-a on-request" as one, which is no policy Codex
 # accepts.
 expect("Codex starts its app-server read-only with a supported approval policy",
        (home() / "codex-args").read_text().split("\0"), ["-s", "read-only", "-a", "on-request", "app-server"])
+
+# Codex 0.163 writes a token_usage_record for every response it is billed for.
+# A remote compaction is one only a record names: the token_count after it
+# spends nothing and leaves the running total alone, and a resumed turn may
+# write a record and no token_count at all. Each record counts once, a line
+# repeated under the same id and total being the same response, while a mock
+# backend reusing an id in a later turn is a new one; the token_count lines
+# after the first record repeat them, and one before it, from an older Codex,
+# still counts.
+new_home()
+
+
+def usage(input, output, cached=0, written=0):
+  return {"input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": written, "output_tokens": output,
+          "reasoning_output_tokens": 0, "total_tokens": input + output}
+
+
+def usage_record(turn, response, spent, thread):
+  return {"type": "token_usage_record", "payload": {"thread_id": "t1", "turn_id": turn, "session_id": "t1", "root_turn_id": turn,
+                                                     "response_id": response, "usage": spent, "turn_token_usage": spent, "thread_token_usage": thread}}
+
+
+def snapshot(last, total):
+  return {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": total, "last_token_usage": last, "model_context_window": 258400}}}
+
+
+first, compaction, reply, resumed = usage(31234, 51, 71, 31), usage(61234, 51, 71, 31), usage(62234, 52, 72, 32), usage(1000, 10)
+after_reply = usage(93468, 103, 143, 63)
+rollout("rollout-compacted.jsonl", meta(model_provider="openai", source="exec", thread_source="user", id="t1", session_id="t1", cli_version="0.163.0"),
+        context("gpt-test"), typed("first"), usage_record("turn1", "resp_mock_0001", first, first), snapshot(first, first),
+        usage_record("turn2", "resp_mock_0001", compaction, usage(92468, 102, 142, 62)),
+        {"type": "compacted", "payload": {"message": "", "replacement_history": []}}, context("gpt-test"),
+        snapshot(usage(0, 0), first), typed("second"),
+        usage_record("turn2", "resp_mock_0002", reply, usage(154702, 154, 214, 94)), snapshot(reply, after_reply),
+        usage_record("turn2", "resp_mock_0002", reply, usage(154702, 154, 214, 94)),
+        typed("third"), usage_record("turn3", "resp_mock_0001", resumed, usage(155702, 164, 214, 94)))
+rollout("rollout-upgraded.jsonl", meta(model_provider="openai", source="cli"), context("gpt-older"), typed(),
+        snapshot(usage(100, 10), usage(100, 10)), typed(), usage_record("turn2", "resp_2", usage(200, 20), usage(300, 30)),
+        snapshot(usage(200, 20), usage(300, 30)))
+record = codex()
+expect("Codex counts every response a token_usage_record names, a compaction's and a resumed turn's included, each once", {
+  "today": record["todayTotalTokens"], "byModel": record["todayTokensByModel"], "prompts": record["todayPrompts"], "usage": record["modelUsage"]["gpt-test"],
+}, {
+  "today": 31285 + 61285 + 62286 + 1010 + 330, "byModel": {"gpt-test": 155866, "gpt-older": 330}, "prompts": 5,
+  "usage": {"inputTokens": 155702 - 214 - 94, "outputTokens": 164, "cacheReadInputTokens": 214, "cacheCreationInputTokens": 94},
+}, record)
+
 
 # Codex CLI can front any OpenAI-compatible backend (`--oss`, or a custom
 # model_provider), whose rollouts land beside the subscription's but spend a
@@ -167,6 +221,57 @@ expect("Codex skips lines that aren't usage and tracks the model across turn_con
   "4o": {"inputTokens": 30, "outputTokens": 15, "cacheReadInputTokens": 20, "cacheCreationInputTokens": 0},
   "o3": {"inputTokens": 20, "outputTokens": 5, "cacheReadInputTokens": 10, "cacheCreationInputTokens": 0},
 }, record)
+
+# A line of the wrong shape, or a payload, info or usage that isn't an
+# object, loses that line alone: the turns after it still count.
+new_home()
+rollout("shaped.jsonl", '[{"type": "session_meta"}]', {"type": "session_meta", "payload": [1]},
+        {"type": "turn_context", "payload": ["gpt-x"]}, context("gpt-test"), typed(), tokens(10, 1),
+        {"type": "event_msg", "payload": {"type": "token_count", "info": [1]}},
+        {"type": "event_msg", "payload": {"type": "item_completed", "item": [1]}},
+        {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": [1]}}}, typed(), tokens(20, 2))
+record = codex()
+expect("Codex skips a wrong-shaped rollout line and keeps reading the file",
+       [record["todayTotalTokens"], record["todayPrompts"]], [33, 2], record)
+
+# Only a line with no time at all takes the file's; a time of 0, false, or ""
+# is one that can't be trusted, so it counts nowhere.
+new_home()
+rollout("falsy.jsonl", context("gpt-test"), *(json.dumps({"timestamp": falsy, **tokens(100, 0)}) for falsy in (0, False, "")),
+        *(json.dumps({"timestamp": falsy, **typed()}) for falsy in (0, False, "")), typed(), tokens(10, 1))
+record = codex()
+expect("Codex counts a rollout line with a time of 0, false, or empty nowhere, not on the file's day",
+       [record["todayTotalTokens"], record["todayPrompts"]], [11, 1], record)
+
+# Prompts are the ones typed, as Codex 0.163 records them: one prompt whose
+# tool call took two requests is one, as is a legacy rollout's user_message
+# event; the context Codex adds itself, and a subagent's or guardian's
+# messages, are none, though the tokens they spent count. Those threads start
+# no session either, counting under the one that started them: its root in
+# session_id, as Codex 0.163 writes it, or else its parent_thread_id. A thread
+# of Codex's own that names no other, such as a memory consolidation, counts
+# under none.
+new_home()
+rollout("rollout-paginated.jsonl", meta(model_provider="openai", source="exec", thread_source="user", id="t-exec", session_id="t-exec"),
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn1"}}, context("gpt-test"),
+        {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>"}]}},
+        typed("run ls"), tokens(10, 1, total={"input_tokens": 10}),
+        {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "id": "c1"}}},
+        tokens(20, 2, total={"input_tokens": 30}), {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn1"}})
+rollout("rollout-legacy.jsonl", meta(model_provider="openai", source="cli", id="t-cli"), context("gpt-test"),
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "<user_instructions>", "kind": "user_instructions"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "fix it", "kind": "plain"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "and test it"}}, tokens(40, 4))
+rollout("rollout-review.jsonl", meta(model_provider="openai", source={"subagent": "review"}, thread_source="subagent", id="t-review", session_id="t-exec",
+                                     parent_thread_id="t-exec"), context("gpt-test"), typed(), tokens(100, 10))
+rollout("rollout-memory.jsonl", meta(model_provider="openai", source={"internal": "memory_consolidation"}, thread_source="memory_consolidation", id="t-memory",
+                                     session_id="t-memory"), context("gpt-test"), tokens(300, 30))
+rollout("rollout-guardian.jsonl", meta(model_provider="openai", source={"subagent": {"other": "guardian"}}, thread_source="guardian_review", id="t-guardian",
+                                       parent_thread_id="t-cli"),
+        context("gpt-test"), typed(), tokens(200, 20))
+record = codex()
+expect("Codex counts the prompts typed, not the requests answering them or a subagent's, and a subagent's thread as no session",
+       [record["todayTotalTokens"], record["todayPrompts"], record["todaySessions"], record["totalSessions"]], [737, 3, 2, 2], record)
 
 # Session history only grows, so a refresh reads the files that changed and
 # replays its per-file totals for the rest. pi sessions stay out of that
@@ -238,6 +343,18 @@ expect("Codex rereads per-file totals after a timezone change", list(file_cache(
 record = incremental()
 expect("Codex keeps the usage read before a line that stops the read", record["modelUsage"].get("gpt-broken", {}).get("inputTokens"), 6, record)
 
+# A scan that couldn't read a rollout serves its own run, but isn't cached as
+# the whole story: the next run reads it again.
+if os.geteuid() != 0:
+  new_home()
+  unreadable = rollout("unreadable.jsonl", context("gpt-test"), tokens(7, 0))
+  unreadable.chmod(0)
+  partial = codex("--force")
+  unreadable.chmod(0o644)
+  record = codex("--limits-only")
+  expect("Codex never caches a scan that couldn't read a rollout",
+         [partial["todayTotalTokens"], record["todayTotalTokens"]], [0, 7], record)
+
 # ------------------------------------------------------- pi and opencode
 
 # pi and omp replies count on the openai-codex provider or the Responses API
@@ -300,7 +417,9 @@ while read -r request; do
   id=$(jq -r '.id // empty' <<<"$request")
   case "$(jq -r '.method // empty' <<<"$request")" in
     initialize) jq -cn --argjson id "$id" '{id: $id, result: {}}' ;;
-    account/read) [[ -n ${CODEX_ACCOUNT_READ_HANGS:-} ]] || jq -cn --argjson id "$id" '{id: $id, result: {account: {}}}' ;;
+    account/read)
+      [[ -n ${CODEX_ACCOUNT_READ_HANGS:-} ]] ||
+        jq -cn --argjson id "$id" --argjson result "${CODEX_ACCOUNT_RESULT:-null}" '{id: $id, result: ($result // {account: {}})}' ;;
     account/rateLimits/read)
       jq -cn --argjson id "$id" --argjson limits "$CODEX_RATE_LIMITS" --argjson credits "${CODEX_RESET_CREDITS:-null}" \
         '{id: $id, result: {rateLimits: $limits, rateLimitResetCredits: $credits}}' ;;
@@ -316,7 +435,7 @@ record = codex(env={"CODEX_ACCOUNT_READ_HANGS": 1, "CODEX_RATE_LIMITS": '{"planT
 elapsed = time.monotonic() - started
 expect("Codex reads limits naming their plan without waiting on account/read", {
   "tier": record["tierLabel"], "status": record["usageStatusText"], "limits": [[entry["label"], entry["percent"]] for entry in record["limits"]], "quick": elapsed < 1.8,
-}, {"tier": "pro", "status": "", "limits": [["Weekly (7-day)", 0.36]], "quick": True}, record)
+}, {"tier": "Pro 200", "status": "", "limits": [["Weekly (7-day)", 0.36]], "quick": True}, record)
 
 # Free full resets ride along: only available ones count, and the soonest to
 # lapse is the one worth mentioning.
@@ -324,6 +443,22 @@ record = codex(env={"CODEX_RATE_LIMITS": '{"planType":"pro","primary":{"usedPerc
                     "CODEX_RESET_CREDITS": json.dumps({"availableCount": 2, "credits": [
                       {"status": "available", "expiresAt": 2000000000}, {"status": "available", "expiresAt": 1900000000}, {"status": "used", "expiresAt": 1800000000}]})})
 expect("Codex reports its available free resets", record.get("resetCredits"), {"available": 2, "nextExpiresAt": "2030-03-17T17:46:40+00:00"}, record)
+
+# Credits and account/read are extras: a malformed one loses itself, never
+# the limits already read, which stay live.
+for name, credits in (("milliseconds", {"credits": [{"status": "available", "expiresAt": 1900000000000}]}), ("a list", [1]),
+                      ("a number", {"credits": 3}), ("a string", "lots")):
+  record = codex(env={"CODEX_RATE_LIMITS": '{"planType":"pro","primary":{"usedPercent":42,"windowDurationMins":10080}}',
+                      "CODEX_RESET_CREDITS": json.dumps(credits)})
+  expect(f"Codex keeps its limits live when the reset credits are {name}", {
+    "status": record["usageStatusText"], "stale": record["limitsStale"], "limits": [[entry["label"], entry["percent"]] for entry in record["limits"]],
+  }, {"status": "", "stale": False, "limits": [["Weekly (7-day)", 0.42]]}, record)
+for name, answer in (("a list", [1]), ("a string account", {"account": "pro"})):
+  record = codex(env={"CODEX_RATE_LIMITS": '{"primary":{"usedPercent":42,"windowDurationMins":10080}}', "CODEX_ACCOUNT_RESULT": json.dumps(answer)})
+  expect(f"Codex keeps its limits when account/read answers {name}", {
+    "tier": record["tierLabel"], "status": record["usageStatusText"], "stale": record["limitsStale"],
+    "limits": [[entry["label"], entry["percent"]] for entry in record["limits"]],
+  }, {"tier": "", "status": "", "stale": False, "limits": [["Weekly (7-day)", 0.42]]}, record)
 
 # A Business seat with a spend cap and no rate windows reports the cap alone,
 # its share taken from the amounts; a zero cap takes the reported percentage.
@@ -359,7 +494,7 @@ done
 record = codex()
 expect("Codex reads replies batched with notifications", {
   "tier": record["tierLabel"], "status": record["usageStatusText"], "limits": [[entry["label"], entry["percent"]] for entry in record["limits"]],
-}, {"tier": "plus", "status": "", "limits": [["5h window", 0.05]]}, record)
+}, {"tier": "Plus", "status": "", "limits": [["5h window", 0.05]]}, record)
 
 # Without temporary space the probe still runs, only without Codex's error
 # text.

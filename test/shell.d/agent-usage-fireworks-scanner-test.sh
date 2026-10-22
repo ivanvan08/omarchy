@@ -153,6 +153,29 @@ expect("a failed balance check with nothing kept says so and keeps the tokens",
        [record["ready"], "balance" in record, record["modelUsage"]["kimi-k2.5"]["outputTokens"], record["usageStatusText"], record["limitsStale"]],
        [True, False, 20, "Balance unavailable", True], record)
 
+# Only the billing-role gate (403) means the key has no live balance; any
+# other failed or unreadable getBalance keeps the last live one, stale, never
+# replacing it with an estimate. An overdrawn ledger has nothing left.
+sandbox()
+signed_in()
+fireworks()
+for name, answer in (("answers 500", 500), ("is cut short", lambda request: http.client.IncompleteRead(b"{", 9)),
+                     ("answers an amount past a float", {"balance": {"units": "1e400"}})):
+  record = fireworks(routes=dict(ROUTES, **{":getBalance": answer}))
+  expect(f"a getBalance that {name} keeps the last live balance, stale",
+         [record["balance"], record["limitsStale"], record["usageStatusText"]],
+         [{"remaining": 12.5, "funded": 20.0, "spent": 7.5, "currency": "USD", "estimated": False}, True, ""], record)
+record = fireworks(routes=dict(ROUTES, **{":getBalance": {"balance": {"units": "-5"}}}))
+expect("an overdrawn live balance reads as nothing left", record["balance"],
+       {"remaining": 0.0, "funded": 20.0, "spent": 20.0, "currency": "USD", "estimated": False}, record)
+
+# FIREWORKS_API_BASE_URL moves the endpoint, never the key onto plain HTTP to
+# another machine, nor into a URL that isn't one.
+for url in ("http://evil.example", "not a url"):
+  record = fireworks(FIREWORKS_API_BASE_URL=url)
+  expect(f"Fireworks sends its key to no untrusted endpoint ({url})",
+         [fireworks.asked, record["limitsStale"], "HTTPS" in record["authHelpText"]], [[], True, True], record)
+
 # Usage and balance both unreachable with nothing kept: the stats source is
 # unavailable.
 sandbox()
@@ -196,6 +219,14 @@ with FakeHttp(dict(accounts("acct-one", "acct-two"), **ROUTES)) as http:
 expect("Fireworks asks for an accountId when the key reaches several accounts",
        [asked_accounts(http), record["limitsStale"], "Set accountId" in record["authHelpText"]], [[], True, True], record)
 
+# An account list that isn't a list is a failed check: the kept answers stand.
+with FakeHttp(dict(accounts("acct-one"), **ROUTES)):
+  collect("fireworks", "--force")
+with FakeHttp(dict({"/v1/accounts?": {"accounts": None}}, **ROUTES)):
+  record = collect("fireworks", "--force")
+expect("Fireworks keeps its last answers past an account list that isn't one",
+       [record["ready"], record["todayTotalTokens"], remaining(record), record["limitsStale"]], [True, 120, 12.5, True], record)
+
 # The key now reaching another account starts over: the first account's
 # usage and balance never stand in for it when its own checks fail.
 with FakeHttp(dict(accounts("acct-two"), **{":getBalance": 500, "/billingUsage": 500, "/usageCosts:query": 500})):
@@ -235,6 +266,10 @@ expect("untrusted token fields are skipped", module.summarize_usage({"serverless
   {"startTime": TODAY + "T00:00:00Z", "promptTokens": 1e300, "completionTokens": "inf", "group": {"model_name": "b"}},
   {"startTime": TODAY + "T00:00:00Z", "promptTokens": -5, "completionTokens": 7, "group": {"model_name": "c"}},
 ]})["modelUsage"], {"c": {"inputTokens": 0, "outputTokens": 7, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}})
+expect("a bucket time at the calendar's edge has no day, and its tokens still count",
+       [module.row_date({"startTime": "9999-12-31T23:00:00-05:00"}), module.row_date({"startTime": "0001-01-01T00:00:00+05:00"}),
+        module.summarize_usage({"serverlessCosts": [{"startTime": "9999-12-31T23:00:00-05:00", "completionTokens": "7"}]})["modelUsage"]["unknown"]["outputTokens"]],
+       ["", "", 7])
 expect("Money reads units and nanos", float(module.money_value({"units": "12", "nanos": 430000000})), 12.43)
 
 # billingUsage pages long ranges, so every continuation token is followed,
@@ -261,9 +296,11 @@ with FakeHttp({"/v1/accounts": []}):
   odd_object = fails(lambda: client.request("/v1/accounts"))
 with FakeHttp({"/billingUsage": {"serverlessCosts": "rows"}}):
   odd_rows = fails(lambda: client.usage("example", date(2026, 7, 1), date(2026, 8, 1)))
+with FakeHttp({"/usageCosts:query": 403, "/billing/summary": {"lineItems": None}}):
+  odd_items = fails(lambda: client.spent("example", "2026-07-01T00:00:00Z", "2026-07-31T00:00:00Z"))
 with FakeHttp({"/billingUsage": {}}):
   idle = client.usage("example", date(2026, 7, 1), date(2026, 8, 1))
-expect("a reply of the wrong shape fails, and a missing usage list reads as idle", [odd_object, odd_rows, idle], [True, True, {"serverlessCosts": []}])
+expect("a reply of the wrong shape fails, and a missing usage list reads as idle", [odd_object, odd_rows, odd_items, idle], [True, True, True, {"serverlessCosts": []}])
 
 # East of Greenwich, a local-midnight bucket starts on the previous UTC date;
 # the row still lands on the local day it names, and the query window asks
@@ -289,6 +326,9 @@ sandbox()
 auth = home() / ".fireworks" / "auth.ini"
 signed_in()
 expect("firectl's auth.ini gives the key and account", list(module.read_auth_file(auth)), ["fw_test", "example"])
+unreadable = home() / "latin1.ini"
+unreadable.write_bytes(b"[default]\napi_key = fw_caf\xe9\n")
+expect("an auth.ini that isn't UTF-8 reads as no key", list(module.read_auth_file(unreadable)), ["", ""])
 missing = home() / "missing.ini"
 opencode_auth(None, "fireworks-ai", "fw_opencode")
 expect("opencode's key is the last resort", [module.credentials(missing, {})[0], module.credentials(auth, {})[0]], ["fw_opencode", "fw_test"])
